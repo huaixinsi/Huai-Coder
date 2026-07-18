@@ -5,22 +5,32 @@ services:
       POSTGRES_DB: huai_coder_dev
       POSTGRES_USER: huai_coder
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    volumes: [postgres_data:/var/lib/postgresql/data]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U huai_coder -d huai_coder_dev"]
       interval: 5s
       timeout: 5s
       retries: 10
   backend:
-    build: {context: .., dockerfile: deploy/Dockerfile.backend}
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
     environment:
       DATABASE_URL: postgresql+asyncpg://huai_coder:${POSTGRES_PASSWORD}@db:5432/huai_coder_dev
       CORS_ORIGINS: http://localhost:5173,http://localhost
-    ports: ["8000:8000"]
-    depends_on: {db: {condition: service_healthy}}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
   frontend:
-    build: {context: .., dockerfile: deploy/Dockerfile.frontend}
-    ports: ["80:80"]
-    depends_on: [backend]
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
 volumes:
   postgres_data:
