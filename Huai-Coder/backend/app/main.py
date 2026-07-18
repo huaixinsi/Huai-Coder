@@ -79,12 +79,18 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(run)
     async def events():
-        async for event in run_agent(request.prompt):
-            db.add(AgentEventRecord(run_id=run.id, event_type=event.type, content=event.content, tool=event.tool))
-            if event.type in {"run.finished", "run.failed"}:
-                run.status = "completed" if event.type == "run.finished" else "failed"
-            await db.commit()
-            yield f"data: {json.dumps({'type': event.type, 'content': event.content, 'tool': event.tool}, ensure_ascii=False)}\n\n"
+        try:
+            async for event in run_agent(request.prompt):
+                db.add(AgentEventRecord(run_id=run.id, event_type=event.type, content=event.content, tool=event.tool))
+                if event.type in {"run.finished", "run.failed"}:
+                    run.status = "completed" if event.type == "run.finished" else "failed"
+                await db.commit()
+                yield f"data: {json.dumps({'run_id': run.id, 'type': event.type, 'content': event.content, 'tool': event.tool}, ensure_ascii=False)}\n\n"
+        except Exception as error:
+            run.status = "failed"
+            failure = AgentEventRecord(run_id=run.id, event_type="run.failed", content=str(error))
+            db.add(failure); await db.commit()
+            yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.failed', 'content': 'Agent run failed'}, ensure_ascii=False)}\n\n"
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.get("/api/runs/{run_id}/events")
