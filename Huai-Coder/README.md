@@ -1,27 +1,35 @@
 # Huai-Coder
 
-Phase 01 foundation and Phase 02 ReAct Agent demonstration.
+Huai-Coder 第一、二阶段基础版本。
 
-## Docker
+## Docker 启动
 
-Create a local `.env` from `.env.example`, set `POSTGRES_PASSWORD`, then run:
+在当前目录创建 `.env`，设置 `POSTGRES_PASSWORD`，然后执行：
 
 ```powershell
 docker compose up -d --build
 ```
 
-## Phase 02
+API 健康检查：<http://localhost:8000/health>
 
-The backend exposes `POST /api/runs` as an SSE stream. The frontend renders run status, tool calls, and streamed agent messages.
+## 第一阶段成果
 
-Supported demo commands:
+- FastAPI 后端与 PostgreSQL 数据库
+- 项目、会话、消息基础 API
+- React/Vite 前端工作区
+- Docker Compose 启动环境
+- Alembic 数据库迁移
+- `.env` 和敏感信息提交防护
 
-- `/list .` - list files in the workspace
-- `/read README.md` - read a workspace file
+## 第二阶段成果
 
-The file tools reject paths outside the workspace root. Configure `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` to enable an OpenAI-compatible `/chat/completions` request for ordinary prompts. Run and event records are persisted in PostgreSQL, and LangGraph checkpoints use the PostgreSQL checkpointer. Schema migrations are stored under `backend/migrations`; authentication is planned for a later phase.
+- LangGraph ReAct Agent 基础图
+- OpenAI-compatible 模型接口配置
+- `list_dir`、`read_file`、`grep_code` 文件工具
+- 工作区路径越界保护
+- SSE Agent 事件流
+- Agent Run/Event 持久化
+- PostgreSQL LangGraph Checkpointer
+- React 项目列表、聊天时间线和运行状态展示
 
-## Phase Results
-
-- **Phase 01:** FastAPI, React/Vite, PostgreSQL, Docker Compose, health check, and Git secret protection.
-- **Phase 02:** Agent event model, SSE run endpoint, safe file tools, and React chat timeline.
+当前阶段仍未实现登录认证，后续阶段继续完善。
