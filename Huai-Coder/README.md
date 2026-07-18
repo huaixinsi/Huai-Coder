@@ -1,18 +1,27 @@
 # Huai-Coder
 
-第一阶段基础设施：FastAPI、PostgreSQL 与健康检查 API。
+Phase 01 foundation and Phase 02 ReAct Agent demonstration.
 
-## Docker 启动
+## Docker
 
-复制 `.env.example` 为 `.env`，仅在本机填写 `POSTGRES_PASSWORD`，然后执行：
+Create a local `.env` from `.env.example`, set `POSTGRES_PASSWORD`, then run:
 
-```bash
+```powershell
 docker compose up -d --build
 ```
 
-API 健康检查地址：`http://localhost:8000/health`。`.env` 已被 Git 忽略，真实凭据不得提交到仓库。
+## Phase 02
 
-## 阶段成果
+The backend exposes `POST /api/runs` as an SSE stream. The frontend renders run status, tool calls, and streamed agent messages.
 
-- **第一阶段：基础设施与前后端骨架**：完成 FastAPI、React/Vite、PostgreSQL 和 Docker Compose 基础环境，提供 API 健康检查入口，并加入环境变量与敏感信息提交防护。
-- **第二阶段：ReAct Agent 与实时事件流**：接入 Agent 运行接口、基础文件工具、SSE 事件流和 React 聊天时间线，支持 `/list` 与 `/read` 工具演示。
+Supported demo commands:
+
+- `/list .` - list files in the workspace
+- `/read README.md` - read a workspace file
+
+The file tools reject paths outside the workspace root. The current phase uses a deterministic agent demonstration; OpenAI-compatible model calls, persistent event history, and authentication are not implemented yet.
+
+## Phase Results
+
+- **Phase 01:** FastAPI, React/Vite, PostgreSQL, Docker Compose, health check, and Git secret protection.
+- **Phase 02:** Agent event model, SSE run endpoint, safe file tools, and React chat timeline.
