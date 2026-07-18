@@ -1,6 +1,8 @@
 from typing import AsyncIterator, TypedDict
 from dataclasses import dataclass
 from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from .config import get_settings
 from .tools import execute_tool
 from .llm import complete
 
@@ -38,13 +40,17 @@ async def _execute(state: AgentState) -> AgentState:
     events.append(AgentEvent("run.finished"))
     return {**state, "response": events[-2].content, "events": events}
 
-_graph = StateGraph(AgentState)
-_graph.add_node("execute", _execute)
-_graph.add_edge(START, "execute")
-_graph.add_edge("execute", END)
-agent_graph = _graph.compile()
+_builder = StateGraph(AgentState)
+_builder.add_node("execute", _execute)
+_builder.add_edge(START, "execute")
+_builder.add_edge("execute", END)
 
 async def run_agent(prompt: str) -> AsyncIterator[AgentEvent]:
-    result = await agent_graph.ainvoke({"prompt": prompt, "response": "", "events": []})
+    settings = get_settings()
+    connection_string = settings.database_url.replace("+asyncpg", "")
+    async with AsyncPostgresSaver.from_conn_string(connection_string) as checkpointer:
+        await checkpointer.setup()
+        graph = _builder.compile(checkpointer=checkpointer)
+        result = await graph.ainvoke({"prompt": prompt, "response": "", "events": []}, config={"configurable": {"thread_id": prompt[:80]}})
     for event in result["events"]:
         yield event
