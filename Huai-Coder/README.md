@@ -19,7 +19,7 @@ Supported demo commands:
 - `/list .` - list files in the workspace
 - `/read README.md` - read a workspace file
 
-The file tools reject paths outside the workspace root. The current phase uses a deterministic agent demonstration; OpenAI-compatible model calls, persistent event history, and authentication are not implemented yet.
+The file tools reject paths outside the workspace root. Configure `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` to enable an OpenAI-compatible `/chat/completions` request for ordinary prompts. Run and event records are persisted in PostgreSQL, and LangGraph checkpoints use the PostgreSQL checkpointer. Schema migrations are stored under `backend/migrations`; authentication is planned for a later phase.
 
 ## Phase Results
 
