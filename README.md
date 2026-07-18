@@ -1,26 +1,34 @@
 # Huai-Coder
 
-Huai-Coder 是一个面向智能编码工作流的 Python Web 项目。
+Huai-Coder is a Python web project for intelligent coding workflows.
 
-## 当前阶段
+## Current Results
 
-- **第一阶段：基础设施与前后端骨架**：完成 FastAPI、React/Vite、PostgreSQL 和 Docker Compose 基础环境，提供 API 健康检查入口，并加入环境变量与敏感信息提交防护。
+- **Phase 01 - Foundation:** FastAPI, React/Vite, PostgreSQL, Docker Compose, health check API, and secret-file protection.
+- **Phase 02 - ReAct Agent:** Agent run events, SSE streaming, workspace-safe file tools, and a React chat timeline.
 
-## 启动方式
+## Start
 
-进入项目目录后，复制 `.env.example` 为 `.env`，填写本地数据库密码：
-
-```bash
+```powershell
 cd Huai-Coder
-docker compose --env-file .env -f deploy/docker-compose.yml up --build
+Copy-Item .env.example .env
+docker compose up -d --build
 ```
 
-API 健康检查地址：<http://localhost:8000/health>。
+Endpoints:
 
-详细说明见 [`Huai-Coder/README.md`](Huai-Coder/README.md)。
+- Frontend: http://localhost
+- Health check: http://localhost:8000/health
+- Agent run stream: `POST http://localhost:8000/api/runs`
 
-## Git 约定
+Example request:
 
-每个功能独立创建分支，完成校对和验证后提交 Pull Request，审核通过后再合并到主分支。真实凭据不得提交到仓库。
+```json
+{"prompt":"/list ."}
+```
 
+The demo currently supports `/list <path>` and `/read <path>`. File access is restricted to the workspace root. Real LLM calls, persistent run events, and authentication are planned for later phases.
 
+## Git Workflow
+
+Each phase or feature uses an independent branch, is verified, submitted as a Pull Request, and merged into `main` after review. Secrets must never be committed.
