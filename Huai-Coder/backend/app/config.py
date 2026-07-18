@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "postgresql+asyncpg://huai_coder:huai_coder@db:5432/huai_coder_dev"
     cors_origins: str = "http://localhost:5173,http://localhost"
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = ""
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     @property
     def cors_origin_list(self) -> list[str]:

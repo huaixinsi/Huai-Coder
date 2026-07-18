@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .database import Base, engine, get_db
+from .models import AgentEventRecord, AgentRun
 
 settings = get_settings()
 @asynccontextmanager
@@ -30,8 +31,21 @@ class RunRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=12000)
 
 @app.post("/api/runs")
-async def create_run(request: RunRequest):
+async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
+    run = AgentRun(prompt=request.prompt, status="running")
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
     async def events():
         async for event in run_agent(request.prompt):
+            db.add(AgentEventRecord(run_id=run.id, event_type=event.type, content=event.content, tool=event.tool))
+            if event.type in {"run.finished", "run.failed"}:
+                run.status = "completed" if event.type == "run.finished" else "failed"
+            await db.commit()
             yield f"data: {json.dumps({'type': event.type, 'content': event.content, 'tool': event.tool}, ensure_ascii=False)}\n\n"
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.get("/api/runs/{run_id}/events")
+async def list_run_events(run_id: int, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import select
+    return (await db.scalars(select(AgentEventRecord).where(AgentEventRecord.run_id == run_id).order_by(AgentEventRecord.id))).all()
