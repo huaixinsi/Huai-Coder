@@ -13,7 +13,7 @@ function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectName, setProjectName] = useState("");
   useEffect(() => { fetch(`${API}/api/projects`).then(response => response.ok ? response.json() : []).then(setProjects).catch(() => undefined); }, []);
-  async function createProject() { if (!projectName.trim()) return; const response = await fetch(`${API}/api/projects`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: projectName.trim() }) }); if (response.ok) { setProjects(items => [await response.json(), ...items]); setProjectName(""); } }
+  async function createProject() { if (!projectName.trim()) return; const response = await fetch(`${API}/api/projects`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: projectName.trim() }) }); if (response.ok) { const project = await response.json(); setProjects(items => [project, ...items]); setProjectName(""); } }
   async function submit(event: FormEvent) {
     event.preventDefault(); if (!prompt.trim() || running) return;
     const value = prompt.trim(); setPrompt(""); setRunning(true); setEvents(items => [...items, { type: "user", content: value }]);
