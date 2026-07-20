@@ -24,14 +24,14 @@ def _workspace_context(root: Path) -> str:
             continue
         relative = str(path.relative_to(root))
         files.append(relative)
-        if len(excerpts) < 12 and path.suffix.lower() in {".py", ".ts", ".tsx", ".js", ".json", ".md", ".yml", ".yaml"}:
+        if len(excerpts) < 40 and path.suffix.lower() in {".py", ".ts", ".tsx", ".js", ".json", ".md", ".yml", ".yaml", ".java", ".go", ".rs", ".sql", ".html", ".css"}:
             try:
-                content = path.read_text(encoding="utf-8")[:2500]
+                content = path.read_text(encoding="utf-8")[:4000]
                 excerpts.append(f"--- {relative} ---\n{content}")
                 total += len(content)
             except (OSError, UnicodeDecodeError):
                 pass
-        if len(files) >= 200 or total >= 18000:
+        if total >= 60000:
             break
     return "Project files:\n" + ("\n".join(files) or "(empty)") + "\n\nRelevant excerpts:\n" + ("\n\n".join(excerpts) or "(none)")
 
