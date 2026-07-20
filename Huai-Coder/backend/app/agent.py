@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import AsyncIterator, TypedDict
 from dataclasses import dataclass
 from langgraph.graph import END, START, StateGraph
@@ -8,8 +9,31 @@ from .llm import complete
 
 class AgentState(TypedDict):
     prompt: str
+    user_prompt: str
+    workspace: str
     response: str
     events: list["AgentEvent"]
+
+def _workspace_context(root: Path) -> str:
+    """Give the model a bounded, useful snapshot of the selected project."""
+    files: list[str] = []
+    excerpts: list[str] = []
+    total = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or any(part in {".git", "node_modules", "__pycache__"} for part in path.parts):
+            continue
+        relative = str(path.relative_to(root))
+        files.append(relative)
+        if len(excerpts) < 12 and path.suffix.lower() in {".py", ".ts", ".tsx", ".js", ".json", ".md", ".yml", ".yaml"}:
+            try:
+                content = path.read_text(encoding="utf-8")[:2500]
+                excerpts.append(f"--- {relative} ---\n{content}")
+                total += len(content)
+            except (OSError, UnicodeDecodeError):
+                pass
+        if len(files) >= 200 or total >= 18000:
+            break
+    return "Project files:\n" + ("\n".join(files) or "(empty)") + "\n\nRelevant excerpts:\n" + ("\n\n".join(excerpts) or "(none)")
 
 @dataclass
 class AgentEvent:
@@ -18,22 +42,23 @@ class AgentEvent:
     tool: str | None = None
 
 async def _execute(state: AgentState) -> AgentState:
+    user_prompt = state["user_prompt"]
     prompt = state["prompt"]
     events = [AgentEvent("run.started")]
-    if prompt.startswith("/list"):
-        path = prompt.removeprefix("/list").strip() or "."
+    if user_prompt.startswith("/list"):
+        path = user_prompt.removeprefix("/list").strip() or "."
         events.append(AgentEvent("tool.started", tool="list_dir"))
-        result = await execute_tool("list_dir", {"path": path})
+        result = await execute_tool("list_dir", {"path": path}, Path(state.get("workspace", ".")))
         events.extend([AgentEvent("tool.finished", result, "list_dir"), AgentEvent("message.delta", result)])
-    elif prompt.startswith("/read"):
-        path = prompt.removeprefix("/read").strip()
+    elif user_prompt.startswith("/read"):
+        path = user_prompt.removeprefix("/read").strip()
         events.append(AgentEvent("tool.started", tool="read_file"))
-        result = await execute_tool("read_file", {"path": path})
+        result = await execute_tool("read_file", {"path": path}, Path(state.get("workspace", ".")))
         events.extend([AgentEvent("tool.finished", result, "read_file"), AgentEvent("message.delta", result)])
-    elif prompt.startswith("/grep"):
-        query, _, path = prompt.removeprefix("/grep").strip().partition(" ")
+    elif user_prompt.startswith("/grep"):
+        query, _, path = user_prompt.removeprefix("/grep").strip().partition(" ")
         events.append(AgentEvent("tool.started", tool="grep_code"))
-        result = await execute_tool("grep_code", {"query": query, "path": path or "."})
+        result = await execute_tool("grep_code", {"query": query, "path": path or "."}, Path(state.get("workspace", ".")))
         events.extend([AgentEvent("tool.finished", result, "grep_code"), AgentEvent("message.delta", result)])
     else:
         events.append(AgentEvent("message.delta", await complete(prompt)))
@@ -45,12 +70,15 @@ _builder.add_node("execute", _execute)
 _builder.add_edge(START, "execute")
 _builder.add_edge("execute", END)
 
-async def run_agent(prompt: str) -> AsyncIterator[AgentEvent]:
+async def run_agent(prompt: str, workspace: str = ".", history: list[tuple[str, str]] | None = None, thread_id: str = "default") -> AsyncIterator[AgentEvent]:
     settings = get_settings()
     connection_string = settings.database_url.replace("+asyncpg", "")
     async with AsyncPostgresSaver.from_conn_string(connection_string) as checkpointer:
         await checkpointer.setup()
         graph = _builder.compile(checkpointer=checkpointer)
-        result = await graph.ainvoke({"prompt": prompt, "response": "", "events": []}, config={"configurable": {"thread_id": prompt[:80]}})
+        context = _workspace_context(Path(workspace))
+        previous = "\n".join(f"{role}: {content}" for role, content in (history or [])[-20:])
+        enriched_prompt = f"You are working in the selected project. Use the project context below to answer. If exact details are needed, inspect files with the available workspace tools.\n\nConversation history:\n{previous or '(none)'}\n\n{context}\n\nUser request:\n{prompt}"
+        result = await graph.ainvoke({"prompt": enriched_prompt, "user_prompt": prompt, "response": "", "events": [], "workspace": workspace}, config={"configurable": {"thread_id": thread_id}})
     for event in result["events"]:
         yield event
