@@ -130,10 +130,23 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
     async def events():
         try:
             workspace = str((WORKSPACE_ROOT / "projects" / str(request.project_id)).resolve()) if request.project_id else str(WORKSPACE_ROOT)
-            if request.prompt.startswith("/write ") or request.prompt.startswith("/exec "):
+            if request.prompt.startswith("/write ") or request.prompt.startswith("/exec ") or request.prompt.startswith("/read "):
                 if request.prompt.startswith("/write "):
                     _, path, content = request.prompt.split(" ", 2)
                     tool_name, arguments, risk, target = "write_file", {"path": path, "content": content}, get_tool("write_file").risk, path
+                elif request.prompt.startswith("/read "):
+                    path = request.prompt.removeprefix("/read ").strip()
+                    guard = PathGuard((WORKSPACE_ROOT / "projects" / str(request.project_id)).resolve())
+                    if not guard.is_sensitive(guard.resolve(path)):
+                        # Non-sensitive reads continue through the normal Agent tool path.
+                        history = [(message.role, message.content) for message in previous_messages]
+                        async for event in run_agent(request.prompt, workspace, history, f"session-{session.id}"):
+                            db.add(AgentEventRecord(run_id=run.id, event_type=event.type, content=event.content, tool=event.tool))
+                            await db.commit()
+                            yield f"data: {json.dumps({'run_id': run.id, 'type': event.type, 'content': event.content, 'tool': event.tool}, ensure_ascii=False)}\n\n"
+                        return
+                    tool_name, arguments, risk, target = "read_file", {"path": path}, get_tool("read_file").risk, path
+                    risk = type(risk)("high", "sensitive file access requires explicit approval", True)
                 else:
                     command = request.prompt.removeprefix("/exec ").strip()
                     tool_name, arguments, risk, target = "execute_command", {"command": command}, command_risk(command), "."
@@ -153,6 +166,9 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                     yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.failed', 'content': f'Approval {approval.status.lower()}'}, ensure_ascii=False)}\n\n"; return
                 guard = PathGuard(Path(workspace))
                 if tool_name == "write_file": result = get_tool(tool_name).handler(arguments["path"], arguments["content"], guard)
+                elif tool_name == "read_file":
+                    get_tool(tool_name).handler(arguments["path"], guard)
+                    result = "已获批准读取敏感配置，具体内容已隐藏，不会显示在聊天或审计日志中。"
                 else: result = await get_tool(tool_name).handler(arguments["command"], guard)
                 run.status = "completed"; db.add(AuditLog(project_id=request.project_id, session_id=session.id, run_id=run.id, event_type="tool.executed", tool_name=tool_name, details=scrub(result)))
                 await db.commit()

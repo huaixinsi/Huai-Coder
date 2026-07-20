@@ -5,6 +5,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from .config import get_settings
 from .registry import get_tool
+
+SENSITIVE_REQUEST_MARKERS = (".env", "密钥", "密码", "token", "api_key", "apikey", "secret", "凭证", "access key")
 from .llm import complete
 
 class AgentState(TypedDict):
@@ -45,7 +47,10 @@ async def _execute(state: AgentState) -> AgentState:
     user_prompt = state["user_prompt"]
     prompt = state["prompt"]
     events = [AgentEvent("run.started")]
-    if user_prompt.startswith("/list"):
+    if any(marker in user_prompt.lower() for marker in SENSITIVE_REQUEST_MARKERS):
+        result = "敏感配置不会被自动读取或回显。若需要访问，请使用 /read .env，系统会先请求你的明确批准。"
+        events.append(AgentEvent("message.delta", result))
+    elif user_prompt.startswith("/list"):
         path = user_prompt.removeprefix("/list").strip() or "."
         events.append(AgentEvent("tool.started", tool="list_dir"))
         result = get_tool("list_dir").handler(path, Path(state.get("workspace", ".")))
