@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from .config import get_settings
-from .tools import execute_tool
+from .registry import get_tool
 from .llm import complete
 
 class AgentState(TypedDict):
@@ -48,17 +48,17 @@ async def _execute(state: AgentState) -> AgentState:
     if user_prompt.startswith("/list"):
         path = user_prompt.removeprefix("/list").strip() or "."
         events.append(AgentEvent("tool.started", tool="list_dir"))
-        result = await execute_tool("list_dir", {"path": path}, Path(state.get("workspace", ".")))
+        result = get_tool("list_dir").handler(path, Path(state.get("workspace", ".")))
         events.extend([AgentEvent("tool.finished", result, "list_dir"), AgentEvent("message.delta", result)])
     elif user_prompt.startswith("/read"):
         path = user_prompt.removeprefix("/read").strip()
         events.append(AgentEvent("tool.started", tool="read_file"))
-        result = await execute_tool("read_file", {"path": path}, Path(state.get("workspace", ".")))
+        result = get_tool("read_file").handler(path, Path(state.get("workspace", ".")))
         events.extend([AgentEvent("tool.finished", result, "read_file"), AgentEvent("message.delta", result)])
     elif user_prompt.startswith("/grep"):
         query, _, path = user_prompt.removeprefix("/grep").strip().partition(" ")
         events.append(AgentEvent("tool.started", tool="grep_code"))
-        result = await execute_tool("grep_code", {"query": query, "path": path or "."}, Path(state.get("workspace", ".")))
+        result = get_tool("grep_code").handler(query, path or ".", Path(state.get("workspace", ".")))
         events.extend([AgentEvent("tool.finished", result, "grep_code"), AgentEvent("message.delta", result)])
     else:
         events.append(AgentEvent("message.delta", await complete(prompt)))
