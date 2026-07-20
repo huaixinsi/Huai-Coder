@@ -20,6 +20,8 @@ def _list_dir(path: str, guard: PathGuard) -> str:
 
 def _read_file(path: str, guard: PathGuard) -> str:
     target = guard.resolve(path)
+    if guard.is_sensitive(target):
+        raise WorkspaceViolation("sensitive paths require explicit approval")
     if not target.is_file(): return f"Not a file: {path}"
     return target.read_text(encoding="utf-8")[:12000]
 
