@@ -14,9 +14,12 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .database import Base, engine, get_db
-from .models import AgentEventRecord, AgentRun, Approval, AuditLog, Message, Project, Session
+from .models import AgentEventRecord, AgentRun, Approval, AuditLog, Message, Plan, Task, TaskDependency, Project, Session
 from .registry import get_tool, command_risk
 from .security import PathGuard, scrub, WorkspaceViolation
+from .planner import create_plan
+from .executor import mark_task_started, mark_task_success, mark_task_failure, next_task, plan_finished
+from .llm import complete
 
 settings = get_settings()
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "/workspace")).resolve()
@@ -24,6 +27,12 @@ WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "/workspace")).resolve()
 async def lifespan(_: FastAPI):
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # create_all does not alter existing tables; keep local/dev databases compatible.
+        await connection.execute(text("ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES plans(id) ON DELETE SET NULL"))
+        await connection.execute(text("ALTER TABLE approvals ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES plans(id) ON DELETE CASCADE"))
+        await connection.execute(text("ALTER TABLE approvals ADD COLUMN IF NOT EXISTS task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE"))
+        await connection.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES plans(id) ON DELETE CASCADE"))
+        await connection.execute(text("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE"))
     yield
     await engine.dispose()
 
@@ -130,6 +139,23 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
     async def events():
         try:
             workspace = str((WORKSPACE_ROOT / "projects" / str(request.project_id)).resolve()) if request.project_id else str(WORKSPACE_ROOT)
+            if not request.prompt.startswith(("/write ", "/exec ", "/read ", "/list", "/grep")):
+                try:
+                    planned = await create_plan(request.prompt)
+                    plan = Plan(project_id=request.project_id, session_id=session.id, run_id=run.id, goal=planned.goal, summary=planned.summary)
+                    db.add(plan); await db.flush(); run.plan_id = plan.id
+                    task_ids = {}
+                    for item in planned.tasks:
+                        task = Task(plan_id=plan.id, task_key=item["task_key"], title=item["title"], description=item["description"], task_type=item.get("task_type", "inspect"), input_data=json.dumps(item, ensure_ascii=False))
+                        db.add(task); await db.flush(); task_ids[task.task_key] = task.id
+                    for item in planned.tasks:
+                        for dependency in item.get("depends_on", []): db.add(TaskDependency(plan_id=plan.id, task_id=task_ids[item["task_key"]], depends_on_task_id=task_ids[dependency]))
+                    await db.commit()
+                    yield f"data: {json.dumps({'run_id': run.id, 'plan_id': plan.id, 'type': 'plan.created', 'content': planned.summary, 'status': plan.status}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'run_id': run.id, 'plan_id': plan.id, 'type': 'plan.confirmation_required', 'content': planned.goal}, ensure_ascii=False)}\n\n"; return
+                except Exception as error:
+                    run.status = "failed"; await db.commit()
+                    yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.failed', 'content': f'Plan validation failed: {error}'}, ensure_ascii=False)}\n\n"; return
             if request.prompt.startswith("/write ") or request.prompt.startswith("/exec ") or request.prompt.startswith("/read "):
                 if request.prompt.startswith("/write "):
                     _, path, content = request.prompt.split(" ", 2)
@@ -232,3 +258,59 @@ async def cancel_approval(approval_id: int, decision: ApprovalDecision, db: Asyn
 @app.get("/api/runs/{run_id}/audit-events")
 async def list_audit_events(run_id: int, db: AsyncSession = Depends(get_db)):
     return (await db.scalars(select(AuditLog).where(AuditLog.run_id == run_id).order_by(AuditLog.id))).all()
+
+async def get_plan(plan_id: int, db: AsyncSession) -> Plan:
+    plan = await db.get(Plan, plan_id)
+    if plan is None: raise HTTPException(404, "Plan not found")
+    return plan
+
+@app.get("/api/plans/{plan_id}")
+async def read_plan(plan_id: int, db: AsyncSession = Depends(get_db)): return await get_plan(plan_id, db)
+
+@app.get("/api/plans/{plan_id}/tasks")
+async def list_plan_tasks(plan_id: int, db: AsyncSession = Depends(get_db)):
+    await get_plan(plan_id, db); return (await db.scalars(select(Task).where(Task.plan_id == plan_id).order_by(Task.id))).all()
+
+async def execute_plan(plan: Plan, db: AsyncSession):
+    plan.status = "RUNNING"; await db.commit()
+    while True:
+        task = await next_task(db, plan.id)
+        if task is None:
+            if await plan_finished(db, plan): return
+            plan.status = "FAILED"; await db.commit(); return
+        await mark_task_started(db, task)
+        try:
+            result = await complete(f"Execute this task in the project and return a concise result. Task: {task.description}. Success criteria: {json.loads(task.input_data).get('success_criteria', '')}")
+            await mark_task_success(db, task, result)
+        except Exception as error:
+            await mark_task_failure(db, task, "LLM_ERROR", str(error))
+            if task.status == "FAILED": plan.status = "FAILED"; await db.commit(); return
+
+@app.post("/api/plans/{plan_id}/confirm")
+async def confirm_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+    plan = await get_plan(plan_id, db)
+    if plan.status != "WAITING_CONFIRMATION": raise HTTPException(409, "Plan is not awaiting confirmation")
+    plan.status = "READY"; plan.confirmed_at = datetime.now(timezone.utc); await db.commit()
+    await execute_plan(plan, db); return plan
+
+@app.post("/api/plans/{plan_id}/cancel")
+async def cancel_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+    plan = await get_plan(plan_id, db); plan.status = "CANCELLED"; plan.cancelled_at = datetime.now(timezone.utc)
+    await db.execute(text("UPDATE tasks SET status='CANCELLED' WHERE plan_id=:id AND status NOT IN ('SUCCEEDED','FAILED')"), {"id": plan_id}); await db.commit(); return plan
+
+@app.post("/api/plans/{plan_id}/pause")
+async def pause_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+    plan = await get_plan(plan_id, db); plan.status = "PAUSED"; await db.commit(); return plan
+
+@app.post("/api/plans/{plan_id}/resume")
+async def resume_plan(plan_id: int, db: AsyncSession = Depends(get_db)):
+    plan = await get_plan(plan_id, db)
+    if plan.status != "PAUSED": raise HTTPException(409, "Plan is not paused")
+    await execute_plan(plan, db); return plan
+
+@app.post("/api/tasks/{task_id}/retry")
+async def retry_task(task_id: int, db: AsyncSession = Depends(get_db)):
+    task = await db.get(Task, task_id)
+    if task is None: raise HTTPException(404, "Task not found")
+    if task.status != "FAILED": raise HTTPException(409, "Task is not failed")
+    task.status = "PENDING"; await db.commit(); return task
