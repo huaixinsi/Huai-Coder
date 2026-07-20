@@ -6,13 +6,17 @@ from pydantic import BaseModel, Field
 import json
 import os
 import shutil
+import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from .agent import run_agent
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .database import Base, engine, get_db
-from .models import AgentEventRecord, AgentRun, Message, Project, Session
+from .models import AgentEventRecord, AgentRun, Approval, AuditLog, Message, Project, Session
+from .registry import get_tool, command_risk
+from .security import PathGuard, scrub, WorkspaceViolation
 
 settings = get_settings()
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "/workspace")).resolve()
@@ -126,6 +130,34 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
     async def events():
         try:
             workspace = str((WORKSPACE_ROOT / "projects" / str(request.project_id)).resolve()) if request.project_id else str(WORKSPACE_ROOT)
+            if request.prompt.startswith("/write ") or request.prompt.startswith("/exec "):
+                if request.prompt.startswith("/write "):
+                    _, path, content = request.prompt.split(" ", 2)
+                    tool_name, arguments, risk, target = "write_file", {"path": path, "content": content}, get_tool("write_file").risk, path
+                else:
+                    command = request.prompt.removeprefix("/exec ").strip()
+                    tool_name, arguments, risk, target = "execute_command", {"command": command}, command_risk(command), "."
+                approval = Approval(run_id=run.id, session_id=session.id, tool_name=tool_name, arguments=json.dumps(arguments), risk_level=risk.level, risk_reason=risk.reason, target_path=target)
+                db.add(approval)
+                db.add(AuditLog(project_id=request.project_id, session_id=session.id, run_id=run.id, event_type="approval.requested", tool_name=tool_name, details=scrub(arguments)))
+                await db.commit(); await db.refresh(approval)
+                yield f"data: {json.dumps({'run_id': run.id, 'type': 'approval.required', 'approval_id': approval.id, 'tool': tool_name, 'content': risk.reason, 'risk_level': risk.level, 'arguments': scrub(arguments), 'target_path': target}, ensure_ascii=False)}\n\n"
+                while True:
+                    await asyncio.sleep(1)
+                    await db.refresh(approval)
+                    if approval.status != "PENDING": break
+                if approval.status != "APPROVED":
+                    run.status = "cancelled" if approval.status == "CANCELLED" else "failed"
+                    db.add(AuditLog(project_id=request.project_id, session_id=session.id, run_id=run.id, event_type=f"approval.{approval.status.lower()}", tool_name=tool_name, details=approval.resolution_reason or ""))
+                    await db.commit()
+                    yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.failed', 'content': f'Approval {approval.status.lower()}'}, ensure_ascii=False)}\n\n"; return
+                guard = PathGuard(Path(workspace))
+                if tool_name == "write_file": result = get_tool(tool_name).handler(arguments["path"], arguments["content"], guard)
+                else: result = await get_tool(tool_name).handler(arguments["command"], guard)
+                run.status = "completed"; db.add(AuditLog(project_id=request.project_id, session_id=session.id, run_id=run.id, event_type="tool.executed", tool_name=tool_name, details=scrub(result)))
+                await db.commit()
+                yield f"data: {json.dumps({'run_id': run.id, 'type': 'message.delta', 'content': result, 'tool': tool_name}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.finished', 'content': ''}, ensure_ascii=False)}\n\n"; return
             history = [(message.role, message.content) for message in previous_messages]
             async for event in run_agent(request.prompt, workspace, history, f"session-{session.id}"):
                 db.add(AgentEventRecord(run_id=run.id, event_type=event.type, content=event.content, tool=event.tool))
@@ -146,3 +178,41 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
 async def list_run_events(run_id: int, db: AsyncSession = Depends(get_db)):
     from sqlalchemy import select
     return (await db.scalars(select(AgentEventRecord).where(AgentEventRecord.run_id == run_id).order_by(AgentEventRecord.id))).all()
+
+async def _get_approval(approval_id: int, db: AsyncSession) -> Approval:
+    approval = await db.get(Approval, approval_id)
+    if approval is None: raise HTTPException(404, "Approval not found")
+    return approval
+
+@app.get("/api/runs/{run_id}/approvals")
+async def list_approvals(run_id: int, db: AsyncSession = Depends(get_db)):
+    return (await db.scalars(select(Approval).where(Approval.run_id == run_id).order_by(Approval.id))).all()
+
+@app.get("/api/approvals/{approval_id}")
+async def get_approval(approval_id: int, db: AsyncSession = Depends(get_db)):
+    return await _get_approval(approval_id, db)
+
+async def resolve_approval(approval_id: int, status: str, reason: str | None, db: AsyncSession):
+    approval = await _get_approval(approval_id, db)
+    if approval.status != "PENDING": raise HTTPException(409, "Approval is already resolved")
+    approval.status = status; approval.resolution_reason = reason; approval.resolved_at = datetime.now(timezone.utc)
+    await db.commit(); await db.refresh(approval); return approval
+
+class ApprovalDecision(BaseModel):
+    reason: str | None = None
+
+@app.post("/api/approvals/{approval_id}/approve")
+async def approve_approval(approval_id: int, decision: ApprovalDecision, db: AsyncSession = Depends(get_db)):
+    return await resolve_approval(approval_id, "APPROVED", decision.reason, db)
+
+@app.post("/api/approvals/{approval_id}/reject")
+async def reject_approval(approval_id: int, decision: ApprovalDecision, db: AsyncSession = Depends(get_db)):
+    return await resolve_approval(approval_id, "REJECTED", decision.reason, db)
+
+@app.post("/api/approvals/{approval_id}/cancel")
+async def cancel_approval(approval_id: int, decision: ApprovalDecision, db: AsyncSession = Depends(get_db)):
+    return await resolve_approval(approval_id, "CANCELLED", decision.reason, db)
+
+@app.get("/api/runs/{run_id}/audit-events")
+async def list_audit_events(run_id: int, db: AsyncSession = Depends(get_db)):
+    return (await db.scalars(select(AuditLog).where(AuditLog.run_id == run_id).order_by(AuditLog.id))).all()
