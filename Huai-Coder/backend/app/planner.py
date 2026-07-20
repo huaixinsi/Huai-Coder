@@ -38,6 +38,7 @@ async def create_plan(prompt: str, context: str = "") -> ValidatedPlan:
     instruction = f"Create a JSON execution plan only. Maximum 20 tasks. Allowed task_type: inspect, edit, test, command, report. Each task needs task_key,title,description,task_type,depends_on,success_criteria. Never include secrets. User goal: {prompt}\nProject context:\n{context}"
     raw = await complete(instruction)
     start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end <= start:
-        return validate_plan({"goal": prompt, "summary": "先检查项目结构并分析用户目标", "tasks": [{"task_key": "inspect_project", "title": "检查项目结构", "description": prompt, "task_type": "inspect", "depends_on": [], "success_criteria": "返回项目分析结果"}]})
-    return validate_plan(json.loads(raw[start:end + 1]))
+    fallback = {"goal": prompt, "summary": "先检查项目结构并分析用户目标", "tasks": [{"task_key": "inspect_project", "title": "检查项目结构", "description": prompt, "task_type": "inspect", "depends_on": [], "success_criteria": "返回项目分析结果"}]}
+    if start < 0 or end <= start: return validate_plan(fallback)
+    try: return validate_plan(json.loads(raw[start:end + 1]))
+    except (ValueError, json.JSONDecodeError): return validate_plan(fallback)
