@@ -1,18 +1,19 @@
+import os
 from pathlib import Path
 
-WORKSPACE_ROOT = Path.cwd().resolve()
+WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", Path.cwd())).resolve()
 
 
-def _safe_path(value: str) -> Path:
-    candidate = (WORKSPACE_ROOT / value).resolve()
-    if candidate != WORKSPACE_ROOT and WORKSPACE_ROOT not in candidate.parents:
+def _safe_path(value: str, root: Path = WORKSPACE_ROOT) -> Path:
+    candidate = (root / value).resolve()
+    if candidate != root and root not in candidate.parents:
         raise ValueError("path is outside the workspace")
     return candidate
 
 
-async def execute_tool(name: str, arguments: dict[str, str]) -> str:
+async def execute_tool(name: str, arguments: dict[str, str], workspace: Path = WORKSPACE_ROOT) -> str:
     try:
-        path = _safe_path(arguments.get("path", "."))
+        path = _safe_path(arguments.get("path", "."), workspace)
         if name == "list_dir":
             if not path.is_dir():
                 return f"Not a directory: {arguments.get('path', '.') }"
@@ -34,7 +35,7 @@ async def execute_tool(name: str, arguments: dict[str, str]) -> str:
                 try:
                     for number, line in enumerate(file.read_text(encoding="utf-8").splitlines(), 1):
                         if query.lower() in line.lower():
-                            matches.append(f"{file.relative_to(WORKSPACE_ROOT)}:{number}:{line[:300]}")
+                            matches.append(f"{file.relative_to(workspace)}:{number}:{line[:300]}")
                 except (OSError, UnicodeDecodeError):
                     continue
             return "\n".join(matches[:200]) or "No matches"
