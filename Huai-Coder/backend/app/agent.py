@@ -48,7 +48,7 @@ async def _execute(state: AgentState) -> AgentState:
     prompt = state["prompt"]
     events = [AgentEvent("run.started")]
     if any(marker in user_prompt.lower() for marker in SENSITIVE_REQUEST_MARKERS):
-        result = "出于安全原因，我不能读取、输出或推断 .env、API 密钥、密码、Token 或其他凭证内容。可以帮你检查配置项名称、配置格式，或验证密钥是否已配置，但不会显示密钥值。"
+        result = "敏感配置不会被自动读取或回显。若需要访问，请使用 /read .env，系统会先请求你的明确批准。"
         events.append(AgentEvent("message.delta", result))
     elif user_prompt.startswith("/list"):
         path = user_prompt.removeprefix("/list").strip() or "."
