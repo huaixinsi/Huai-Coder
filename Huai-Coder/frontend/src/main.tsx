@@ -23,6 +23,7 @@ type Activity = { type: string; tool?: string; arguments?: string; content?: str
 type ChatMessage = { id: string; role: "user" | "assistant" | "system"; content: string; activities: Activity[]; status?: "running" | "done" | "failed" };
 type Approval = StreamEvent;
 type DirectoryFile = { file: File; relativePath: string };
+type WorkspaceStatus = { bound: boolean; file_count: number };
 type RunStatus = "idle" | "running" | "waiting" | "completed" | "failed" | "stopped";
 
 declare global {
@@ -47,7 +48,7 @@ function ActivityList({ activities }: { activities: Activity[] }) {
   };
   return <details className="execution-panel" open={activities.some(activity => activity.status === "running")}>
     <summary><span className="activity-dot" />执行过程 - {toolCalls.length} 次工具调用<span className="activity-status">已完成 {finished}/{toolCalls.length}</span></summary>
-    <div className="activity-list">{activities.map((activity, index) => activity.type === "context.compacted" ? <div className="context-note" key={`context-${index}`}>上下文已压缩：{activity.content}</div> : <details className={`activity ${activity.status}`} key={`${activity.type}-${activity.tool ?? ""}-${index}`}>
+    <div className="activity-list">{activities.map((activity, index) => activity.type === "context.compacted" || activity.type === "guard" ? <div className={activity.type === "guard" ? "repeat-note" : "context-note"} key={`${activity.type}-${index}`}>{activity.type === "guard" ? "重复调用防护：" : "上下文已压缩："}{activity.content}</div> : <details className={`activity ${activity.status}`} key={`${activity.type}-${activity.tool ?? ""}-${index}`}>
       <summary><span className="activity-dot" />{index + 1}. {activity.tool ?? "工具调用"}<span className="activity-status">{activity.status === "running" ? "进行中" : activity.status === "error" ? "失败" : "已完成"}</span></summary>
       <div className="activity-body">
         {activity.arguments && <><label>参数</label><pre>{formatArguments(activity.arguments)}</pre></>}
@@ -68,6 +69,9 @@ function App() {
   const [selectedSession, setSelectedSession] = useState<number | null>(null);
   const [sessionTitle, setSessionTitle] = useState("");
   const [folderName, setFolderName] = useState("");
+  const [folderByProject, setFolderByProject] = useState<Record<number, string>>({});
+  const [folderBound, setFolderBound] = useState(false);
+  const [folderError, setFolderError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [approvalAssistantId, setApprovalAssistantId] = useState<string | null>(null);
@@ -90,7 +94,13 @@ function App() {
   }
 
   async function selectProject(id: number) {
-    setSelectedProject(id); setFolderName(""); setChatMessages([]); setSelectedSession(null); setPlan(null); setPlanTasks([]); setRunStatus("idle"); await loadMemories(id);
+    setSelectedProject(id); setFolderName(folderByProject[id] ?? ""); setFolderBound(false); setFolderError(""); setChatMessages([]); setSelectedSession(null); setPlan(null); setPlanTasks([]); setRunStatus("idle"); await loadMemories(id);
+    const workspaceResponse = await fetch(`${API}/api/projects/${id}/workspace`);
+    if (workspaceResponse.ok) {
+      const workspace = await workspaceResponse.json() as WorkspaceStatus;
+      setFolderBound(workspace.bound);
+      if (workspace.bound && !folderByProject[id]) setFolderName(`项目工作区（${workspace.file_count} 个文件）`);
+    }
     const r = await fetch(`${API}/api/projects/${id}/sessions`);
     const list: ChatSession[] = r.ok ? await r.json() : [];
     setSessions(list);
@@ -129,7 +139,7 @@ function App() {
   async function deleteProject(id: number) {
     if (!window.confirm("删除项目及其已上传文件？")) return;
     const r = await fetch(`${API}/api/projects/${id}`, { method: "DELETE" });
-    if (r.ok) { setProjects(x => x.filter(project => project.id !== id)); if (selectedProject === id) { setSelectedProject(null); setSelectedSession(null); setChatMessages([]); setMemories([]); } }
+    if (r.ok) { setProjects(x => x.filter(project => project.id !== id)); if (selectedProject === id) { setSelectedProject(null); setSelectedSession(null); setChatMessages([]); setMemories([]); setFolderBound(false); setFolderName(""); } }
   }
 
   async function createMemory() {
@@ -167,6 +177,14 @@ function App() {
     }
     if (item.type === "context.compacted") {
       updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: item.type, content: item.content, status: "info" }] }));
+      return;
+    }
+    if (item.type === "tool.repeat_warning" || item.type === "tool.repeat_rejected" || item.type === "tool.circuit_broken") {
+      updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: "guard", tool: item.tool, content: item.content, status: "info" }] }));
+      return;
+    }
+    if (item.type === "tool.blocked") {
+      updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: "tool", tool: item.tool, content: item.content, status: "error" }] }));
       return;
     }
     if (item.type === "tool.started") {
@@ -219,6 +237,10 @@ function App() {
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (!prompt.trim() || running || approval || !selectedProject || !selectedSession) return;
+    if (!folderBound) {
+      setFolderError("开始对话前，请先绑定当前项目对应的文件夹。绑定后 Agent 才能读取和修改项目文件。");
+      return;
+    }
     const value = prompt.trim();
     const assistantId = `assistant-${Date.now()}`;
     setPrompt(""); setRunning(true); setRunStatus("running");
@@ -256,9 +278,58 @@ function App() {
   const skipExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".war", ".pdf", ".lock"]);
   const maxFileSize = 1024 * 1024;
   async function collectDirectory(handle: FileSystemDirectoryHandle, prefix = ""): Promise<DirectoryFile[]> { const result: DirectoryFile[] = []; for await (const entry of handle.values()) { if (entry.name.startsWith(".") && entry.name !== ".env.example") continue; const relative = prefix ? `${prefix}/${entry.name}` : entry.name; if (entry.kind === "file") { const ext = entry.name.includes(".") ? `.${entry.name.split(".").pop()!.toLowerCase()}` : ""; if (skipExtensions.has(ext)) continue; const file = await entry.getFile(); if (file.size > maxFileSize) continue; result.push({ file, relativePath: relative }); } else { if (skipDirs.has(entry.name)) continue; result.push(...await collectDirectory(entry, relative)); } } return result; }
-  async function uploadBatch(items: DirectoryFile[], label: string) { if (!selectedProject || !items.length) return; setFolderName(`${label}（${items.length} 个文件）`); setUploading(true); try { for (let i = 0; i < items.length; i += 20) { const data = new FormData(); items.slice(i, i + 20).forEach(item => { data.append("files", item.file, item.file.name); data.append("relative_paths", item.relativePath); }); const r = await fetch(`${API}/api/projects/${selectedProject}/files`, { method: "POST", body: data }); if (!r.ok) throw new Error(`上传失败 (${r.status})`); } } finally { setUploading(false); } }
-  async function chooseFolder() { if (!selectedProject || uploading || !window.showDirectoryPicker) return; try { const handle = await window.showDirectoryPicker({ mode: "read" }); await uploadBatch(await collectDirectory(handle), handle.name); } catch (error) { if (!(error instanceof DOMException && error.name === "AbortError")) console.error(error); } }
-  async function uploadFiles(event: React.ChangeEvent<HTMLInputElement>) { if (!selectedProject || !event.target.files?.length) return; const data = new FormData(); Array.from(event.target.files).forEach(file => { data.append("files", file); data.append("relative_paths", file.name); }); setUploading(true); try { const r = await fetch(`${API}/api/projects/${selectedProject}/files`, { method: "POST", body: data }); if (r.ok) setFolderName(`${event.target.files.length} 个文件`); } finally { setUploading(false); event.target.value = ""; } }
+  async function uploadBatch(items: DirectoryFile[], label: string, replace = false) {
+    if (!selectedProject || !items.length) return;
+    setFolderError(""); setUploading(true);
+    try {
+      for (let i = 0; i < items.length; i += 20) {
+        const data = new FormData();
+        items.slice(i, i + 20).forEach(item => { data.append("files", item.file, item.file.name); data.append("relative_paths", item.relativePath); });
+        data.append("replace", replace && i === 0 ? "true" : "false");
+        const r = await fetch(`${API}/api/projects/${selectedProject}/files`, { method: "POST", body: data });
+        if (!r.ok) throw new Error(`上传失败 (${r.status})`);
+      }
+      const displayName = `${label}（${items.length} 个文件）`;
+      setFolderName(displayName); setFolderBound(true);
+      setFolderByProject(current => ({ ...current, [selectedProject]: displayName }));
+    } catch (error) {
+      setFolderError(error instanceof Error ? error.message : "文件夹绑定失败，请重试。");
+    } finally { setUploading(false); }
+  }
+  async function chooseFolder() {
+    if (!selectedProject || uploading) return;
+    if (!window.showDirectoryPicker) {
+      const input = document.createElement("input");
+      input.type = "file"; input.multiple = true; input.setAttribute("webkitdirectory", ""); input.setAttribute("directory", "");
+      input.onchange = () => { void uploadFolderFiles(Array.from(input.files ?? [])); };
+      input.click();
+      return;
+    }
+    if (folderBound && !window.confirm("切换文件夹会替换当前项目工作区中的文件，是否继续？")) return;
+    try {
+      const handle = await window.showDirectoryPicker({ mode: "read" });
+      await uploadBatch(await collectDirectory(handle), handle.name, true);
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) setFolderError(error instanceof Error ? error.message : "文件夹选择失败，请重试。");
+    }
+  }
+  async function uploadFolderFiles(files: File[]) {
+    if (!files.length || !selectedProject) return;
+    if (folderBound && !window.confirm("切换文件夹会替换当前项目工作区中的文件，是否继续？")) return;
+    const firstPath = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath ?? files[0].name;
+    const label = firstPath.split("/")[0] || "所选文件夹";
+    const items = files.filter(file => file.size <= maxFileSize && !skipExtensions.has(`.${file.name.split(".").pop()?.toLowerCase() ?? ""}`)).map(file => ({
+      file,
+      relativePath: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
+    }));
+    await uploadBatch(items, label, true);
+  }
+  async function uploadFiles(event: React.ChangeEvent<HTMLInputElement>) {
+    if (!selectedProject || !event.target.files?.length) return;
+    const items = Array.from(event.target.files).map(file => ({ file, relativePath: file.name }));
+    await uploadBatch(items, `${event.target.files.length} 个文件`, false);
+    event.target.value = "";
+  }
   async function planAction(action: "confirm" | "cancel" | "pause" | "resume") { if (!plan) return; const r = await fetch(`${API}/api/plans/${plan.id}/${action}`, { method: "POST" }); if (r.ok) setPlan(await r.json()); }
   async function decideApproval(action: "approve" | "reject" | "cancel") {
     if (!approval?.approval_id) { setApprovalError("审批记录缺少 ID，请刷新页面后重新发起任务。"); return; }
@@ -332,9 +403,9 @@ function App() {
       </div>
       <div className="hero-art" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="hero-mascot">麻</span><span className="hero-star star-one">✦</span><span className="hero-star star-two">✧</span></div>
     </section>
-    <section className="projects panel"><h2>项目与会话</h2><div className="project-create"><input value={projectName} onChange={event => setProjectName(event.target.value)} placeholder="新建项目" /><button onClick={createProject}>创建</button></div><ul className="project-list">{projects.map(project => <li key={project.id} className={selectedProject === project.id ? "selected" : ""} onClick={() => selectProject(project.id)}><span>{project.name}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteProject(project.id); }}>删除</button></li>)}</ul>{selectedProject && <div className="project-tools"><div className="session-create"><input value={sessionTitle} onChange={event => setSessionTitle(event.target.value)} placeholder="新会话名称" /><button onClick={createSession}>新建会话</button></div><ul className="session-list">{sessions.map(session => <li key={session.id} className={selectedSession === session.id ? "selected" : ""} onClick={() => selectSession(session.id)}><span>{session.title}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteSession(session.id); }}>删除</button></li>)}</ul><div className="folder-area"><button type="button" className="secondary-button" onClick={chooseFolder} disabled={uploading}>{uploading ? "上传中…" : "选择完整文件夹"}</button><label className="secondary-button">选择文件<input type="file" multiple onChange={uploadFiles} disabled={uploading} /></label>{folderName && <span className="folder-name">最近上传：{folderName}</span>}</div><div className="memory-panel"><div className="section-heading"><div><h3>长期记忆</h3><p>只保存可复用的项目事实、决策和约束</p></div><button className="secondary-button" type="button" onClick={compactSelectedSession} disabled={!selectedSession || memoryBusy}>压缩会话</button></div><div className="memory-create"><select value={memoryType} onChange={event => setMemoryType(event.target.value)}><option value="fact">事实</option><option value="decision">决策</option><option value="preference">偏好</option><option value="constraint">约束</option><option value="task">待办</option></select><input value={memoryContent} onChange={event => setMemoryContent(event.target.value)} placeholder="保存一条项目记忆" /><button type="button" onClick={createMemory} disabled={memoryBusy || !memoryContent.trim()}>保存</button></div><ul className="memory-list">{memories.length === 0 ? <li className="muted">暂无项目记忆</li> : memories.map(memory => <li key={memory.id}><span><small>{memory.memory_type} · 重要性 {memory.importance}</small>{memory.content}</span><button type="button" className="delete-button" onClick={() => removeMemory(memory.id)}>删除</button></li>)}</ul></div></div>}</section>
+    <section className="projects panel"><h2>项目与会话</h2><div className="project-create"><input value={projectName} onChange={event => setProjectName(event.target.value)} placeholder="新建项目" /><button onClick={createProject}>创建</button></div><ul className="project-list">{projects.map(project => <li key={project.id} className={selectedProject === project.id ? "selected" : ""} onClick={() => selectProject(project.id)}><span>{project.name}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteProject(project.id); }}>删除</button></li>)}</ul>{selectedProject && <div className="project-tools"><div className="session-create"><input value={sessionTitle} onChange={event => setSessionTitle(event.target.value)} placeholder="新会话名称" /><button onClick={createSession}>新建会话</button></div><ul className="session-list">{sessions.map(session => <li key={session.id} className={selectedSession === session.id ? "selected" : ""} onClick={() => selectSession(session.id)}><span>{session.title}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteSession(session.id); }}>删除</button></li>)}</ul><div className="folder-area"><button type="button" className="secondary-button" onClick={chooseFolder} disabled={uploading}>{uploading ? "上传中…" : "绑定/切换文件夹"}</button><label className="secondary-button">选择文件<input type="file" multiple onChange={uploadFiles} disabled={uploading} /></label>{folderName && <span className="folder-name">当前绑定：{folderName}</span>}{!folderBound && <span className="folder-reminder">请先绑定对应文件夹</span>}{folderError && <span className="folder-error">{folderError}</span>}</div><div className="memory-panel"><div className="section-heading"><div><h3>长期记忆</h3><p>只保存可复用的项目事实、决策和约束</p></div><button className="secondary-button" type="button" onClick={compactSelectedSession} disabled={!selectedSession || memoryBusy}>压缩会话</button></div><div className="memory-create"><select value={memoryType} onChange={event => setMemoryType(event.target.value)}><option value="fact">事实</option><option value="decision">决策</option><option value="preference">偏好</option><option value="constraint">约束</option><option value="task">待办</option></select><input value={memoryContent} onChange={event => setMemoryContent(event.target.value)} placeholder="保存一条项目记忆" /><button type="button" onClick={createMemory} disabled={memoryBusy || !memoryContent.trim()}>保存</button></div><ul className="memory-list">{memories.length === 0 ? <li className="muted">暂无项目记忆</li> : memories.map(memory => <li key={memory.id}><span><small>{memory.memory_type} · 重要性 {memory.importance}</small>{memory.content}</span><button type="button" className="delete-button" onClick={() => removeMemory(memory.id)}>删除</button></li>)}</ul></div></div>}</section>
     {plan && <section className="plan-panel panel"><div className="section-heading"><div><h2>执行计划</h2><p>{plan.goal}</p></div><span className="status-pill">{plan.status}</span></div><p>{plan.summary}</p><div className="plan-tasks">{planTasks.length === 0 ? <p className="muted">正在加载任务列表…</p> : planTasks.map((task, index) => <article key={task.id}><strong>{index + 1}. {task.title}</strong><small>{task.task_key} · {task.task_type} · {task.status} · 重试 {task.retry_count}/2</small><div>{task.description}</div>{task.output_data && <pre>{task.output_data}</pre>}{task.error_message && <pre>{task.error_message}</pre>}</article>)}</div><div className="action-row"><button onClick={() => planAction("confirm")} disabled={plan.status !== "WAITING_CONFIRMATION"}>确认计划</button><button onClick={() => planAction("cancel")} disabled={plan.status === "SUCCEEDED" || plan.status === "CANCELLED"}>取消计划</button><button onClick={() => planAction("pause")} disabled={plan.status !== "RUNNING"}>暂停</button><button onClick={() => planAction("resume")} disabled={plan.status !== "PAUSED"}>继续</button></div></section>}
-    <section className="chat panel"><div className="chat-heading"><div><h2>对话</h2><p>助手回复支持 Markdown；工具调用和上下文压缩显示在执行过程里</p></div><button type="button" className={`run-status ${statusView.kind}`} aria-live="polite" disabled><span className="run-status-icon" aria-hidden="true" />{statusView.label}</button></div><div className="timeline">{chatMessages.length === 0 && <p className="empty">选择项目和会话后，开始向 Agent 提问。</p>}{chatMessages.map(message => <article className={`chat-message ${message.role} ${message.status ?? ""}`} key={message.id}><div className="message-head"><span className="role-label">{message.role === "user" ? "你" : message.role === "assistant" ? "Huai-Coder" : "系统"}</span>{message.role === "assistant" && message.content && <button className="copy-button" onClick={() => copyMessage(message.content)}>复制</button>}</div><ActivityList activities={message.activities} />{message.content ? <div className="message-content"><Markdown value={message.content} /></div> : message.status === "running" && <div className="typing"><i /><i /><i />正在思考…</div>}{message.status === "failed" && <div className="message-error">本次运行未完成，可以继续发送指令。</div>}</article>)}</div><form onSubmit={submit}><input value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="描述你要完成的任务…" disabled={running || !selectedSession} /><button disabled={running || !selectedSession}>{running ? "处理中…" : "发送"}</button></form></section>
+    <section className="chat panel"><div className="chat-heading"><div><h2>对话</h2><p>{folderBound ? `当前会话工作区：${folderName || "已绑定"}` : "每次对话前，请先绑定当前项目对应的文件夹。"}</p></div><button type="button" className={`run-status ${statusView.kind}`} aria-live="polite" disabled><span className="run-status-icon" aria-hidden="true" />{statusView.label}</button></div><div className="timeline">{chatMessages.length === 0 && <p className="empty">选择项目和会话后，开始向 Agent 提问。</p>}{chatMessages.map(message => <article className={`chat-message ${message.role} ${message.status ?? ""}`} key={message.id}><div className="message-head"><span className="role-label">{message.role === "user" ? "你" : message.role === "assistant" ? "Huai-Coder" : "系统"}</span>{message.role === "assistant" && message.content && <button className="copy-button" onClick={() => copyMessage(message.content)}>复制</button>}</div><ActivityList activities={message.activities} />{message.content ? <div className="message-content"><Markdown value={message.content} /></div> : message.status === "running" && <div className="typing"><i /><i /><i />正在思考…</div>}{message.status === "failed" && <div className="message-error">本次运行未完成，可以继续发送指令。</div>}</article>)}</div><form onSubmit={submit}><input value={prompt} onChange={event => setPrompt(event.target.value)} placeholder={folderBound ? "描述你要完成的任务…" : "请先绑定对应文件夹，再开始对话"} disabled={running || !selectedSession || !folderBound} /><button disabled={running || !selectedSession || !folderBound}>{running ? "处理中…" : "发送"}</button></form></section>
     {approval && <div className="approval-modal"><div className="approval-card"><h2>需要审批：{approval.tool}</h2><p>风险等级：{approval.risk_level ?? "未标注"}</p><p>{approval.content}</p><pre>{approval.arguments}</pre><p>目标：{approval.target_path || "当前项目工作区"}</p>{approvalError && <p className="approval-error">{approvalError}</p>}<div className="action-row"><button onClick={() => decideApproval("approve")} disabled={approvalBusy}>{approvalBusy ? "处理中…" : "批准"}</button><button onClick={() => decideApproval("reject")} disabled={approvalBusy}>拒绝</button><button onClick={() => decideApproval("cancel")} disabled={approvalBusy}>取消</button></div></div></div>}
   </main>;
 }

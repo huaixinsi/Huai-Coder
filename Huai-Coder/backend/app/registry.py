@@ -13,6 +13,9 @@ class ToolSpec:
     description: str
     risk: Risk
     handler: Callable[..., Any]
+    # guarded: normal duplicate-call protection; stateful: compare workspace
+    # state before/after the call; polling: exempt from stale-result rules.
+    repeat_policy: str = "guarded"
 
 
 def _list_dir(path: str, guard: PathGuard) -> str:
@@ -109,18 +112,21 @@ TOOLS = {
         "Write a workspace file",
         Risk("high", "changes project contents", True),
         _write_file,
+        "stateful",
     ),
     "execute_command": ToolSpec(
         "execute_command",
         "Run a command in the workspace",
         Risk("medium", "command is not guaranteed read-only", True),
         _execute_command,
+        "stateful",
     ),
     "task": ToolSpec(
         "task",
         "Spawn a sub-agent for a specific task",
         Risk("low", "sub-agent delegation", False),
         _spawn_subagent,
+        "stateful",
     ),
 }
 

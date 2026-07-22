@@ -170,11 +170,14 @@ async def upload_project_files(
     project_id: int,
     files: list[UploadFile] = File(...),
     relative_paths: list[str] = Form(default=[]),
+    replace: bool = Form(default=False),
     db: AsyncSession = Depends(get_db),
 ):
     if await db.get(Project, project_id) is None:
         raise HTTPException(404, "Project not found")
     root = (WORKSPACE_ROOT / "projects" / str(project_id)).resolve()
+    if replace and root.exists() and WORKSPACE_ROOT in root.parents:
+        shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
     for index, upload in enumerate(files):
         relative = (
@@ -188,6 +191,19 @@ async def upload_project_files(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(await upload.read())
     return {"project_id": project_id, "files": len(files)}
+
+
+@app.get("/api/projects/{project_id}/workspace")
+async def get_project_workspace(project_id: int, db: AsyncSession = Depends(get_db)):
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
+    root = (WORKSPACE_ROOT / "projects" / str(project_id)).resolve()
+    file_count = sum(1 for item in root.rglob("*") if item.is_file()) if root.exists() else 0
+    return {
+        "project_id": project_id,
+        "bound": file_count > 0,
+        "file_count": file_count,
+    }
 
 
 @app.get("/api/projects/{project_id}/sessions")
