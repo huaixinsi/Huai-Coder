@@ -17,7 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .agent import AgentEvent, run_agent
 from .context import ContextManager
-from .memory import MEMORY_TYPES, MemoryCandidate, MemoryService
+from .memory import (
+    GLOBAL_MEMORY_SCOPE_ID,
+    MEMORY_TYPES,
+    MemoryCandidate,
+    MemoryService,
+)
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
@@ -44,6 +49,8 @@ from .executor import (
     plan_finished,
 )
 from .llm import complete
+from .registry import get_tool
+from .security import PathGuard
 
 settings = get_settings()
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "/workspace")).resolve()
@@ -140,6 +147,9 @@ async def create_project(request: ProjectRequest, db: AsyncSession = Depends(get
     db.add(project)
     await db.commit()
     await db.refresh(project)
+    (WORKSPACE_ROOT / "projects" / str(project.id)).resolve().mkdir(
+        parents=True, exist_ok=True
+    )
     return project
 
 
@@ -277,6 +287,52 @@ async def list_project_memories(
             session_rows = list((await db.scalars(select(Memory).where(Memory.scope_type == "session", Memory.scope_id.in_(sessions), Memory.status == status))).all())
             rows.extend(session_rows)
     return [_memory_payload(memory) for memory in rows]
+
+
+@app.get("/api/projects/{project_id}/memories/overview")
+async def list_project_memory_overview(
+    project_id: int, db: AsyncSession = Depends(get_db)
+):
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
+    grouped = await MemoryService(settings).list_project_and_global_memories(
+        db, project_id, global_scope_id=GLOBAL_MEMORY_SCOPE_ID
+    )
+    return {
+        "project_id": project_id,
+        "global_scope": {
+            "scope_type": "user",
+            "scope_id": GLOBAL_MEMORY_SCOPE_ID,
+        },
+        "project": [_memory_payload(memory) for memory in grouped["project"]],
+        "global": [_memory_payload(memory) for memory in grouped["global"]],
+    }
+
+
+@app.get("/api/sessions/{session_id}/memories/overview")
+async def list_session_memory_overview(
+    session_id: int, db: AsyncSession = Depends(get_db)
+):
+    session = await db.get(Session, session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+    grouped = await MemoryService(settings).list_session_project_user_memories(
+        db,
+        session_id=session.id,
+        project_id=session.project_id,
+        user_scope_id=GLOBAL_MEMORY_SCOPE_ID,
+    )
+    return {
+        "session_id": session.id,
+        "project_id": session.project_id,
+        "user_scope": {
+            "scope_type": "user",
+            "scope_id": GLOBAL_MEMORY_SCOPE_ID,
+        },
+        "session": [_memory_payload(memory) for memory in grouped["session"]],
+        "project": [_memory_payload(memory) for memory in grouped["project"]],
+        "user": [_memory_payload(memory) for memory in grouped["user"]],
+    }
 
 
 @app.post("/api/memories", status_code=201)
@@ -443,6 +499,47 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                 thread_id=f"session-{session.id}",
                 context_text=prepared_context.render(),
             ):
+                event_payload = {
+                    "run_id": run.id,
+                    "type": event.type,
+                    "content": event.content,
+                    "tool": event.tool,
+                }
+                if event.type == "approval.required":
+                    details: dict = {}
+                    try:
+                        details = json.loads(event.content or "{}")
+                    except json.JSONDecodeError:
+                        details = {}
+                    tool_name = event.tool or details.get("tool") or "unknown"
+                    arguments = details.get("arguments") or {}
+                    try:
+                        tool_spec = get_tool(tool_name)
+                        risk_level = tool_spec.risk.level
+                        risk_reason = details.get("reason") or tool_spec.risk.reason
+                    except Exception:
+                        risk_level = details.get("risk_level") or "medium"
+                        risk_reason = details.get("reason") or "需要人工确认后才能继续执行"
+                    approval = Approval(
+                        run_id=run.id,
+                        session_id=session.id,
+                        tool_name=tool_name,
+                        arguments=json.dumps(arguments, ensure_ascii=False),
+                        risk_level=risk_level,
+                        risk_reason=risk_reason,
+                        target_path=arguments.get("path") if isinstance(arguments, dict) else None,
+                    )
+                    db.add(approval)
+                    await db.flush()
+                    event_payload.update(
+                        {
+                            "approval_id": approval.id,
+                            "risk_level": approval.risk_level,
+                            "arguments": approval.arguments,
+                            "target_path": approval.target_path,
+                            "content": approval.risk_reason,
+                        }
+                    )
                 db.add(
                     AgentEventRecord(
                         run_id=run.id,
@@ -464,7 +561,7 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                         )
                     )
                 await db.commit()
-                yield f"data: {json.dumps({'run_id': run.id, 'type': event.type, 'content': event.content, 'tool': event.tool}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(event_payload, ensure_ascii=False)}\n\n"
             if run.status == "completed":
                 await MemoryService(settings).extract_and_persist(
                     db,
@@ -525,18 +622,251 @@ async def get_approval(approval_id: int, db: AsyncSession = Depends(get_db)):
     return await _get_approval(approval_id, db)
 
 
+async def _execute_approved_tool(approval: Approval, db: AsyncSession) -> str:
+    session = await db.get(Session, approval.session_id)
+    if session is None:
+        return "执行失败：关联会话不存在。"
+    try:
+        tool_spec = get_tool(approval.tool_name)
+        arguments = json.loads(approval.arguments or "{}")
+        if not isinstance(arguments, dict):
+            raise ValueError("审批参数必须是 JSON 对象")
+        workspace = (WORKSPACE_ROOT / "projects" / str(session.project_id)).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        result = tool_spec.handler(guard=PathGuard(workspace), **arguments)
+        if asyncio.iscoroutine(result):
+            result = await result
+        output = str(result)[:12000]
+        event_type = "tool.finished"
+    except Exception as error:
+        output = f"审批后执行失败：{error}"
+        event_type = "tool.failed"
+
+    db.add(
+        AgentEventRecord(
+            run_id=approval.run_id,
+            event_type=event_type,
+            content=output,
+            tool=approval.tool_name,
+        )
+    )
+    db.add(
+        AuditLog(
+            project_id=session.project_id,
+            session_id=session.id,
+            run_id=approval.run_id,
+            event_type="approval.executed" if event_type == "tool.finished" else "approval.execution_failed",
+            tool_name=approval.tool_name,
+            details=json.dumps({"approval_id": approval.id, "result": output}, ensure_ascii=False),
+        )
+    )
+    db.add(
+        Message(
+            session_id=session.id,
+            role="system",
+            content=f"审批已通过，工具 {approval.tool_name} 已执行。\n\n执行结果：\n{output}",
+        )
+    )
+    await db.commit()
+    return output
+
+
+async def _continue_after_approval(
+    approval: Approval, execution_result: str, db: AsyncSession
+) -> list[dict]:
+    """Resume the agent after an approved tool and return the follow-up events."""
+    session = await db.get(Session, approval.session_id)
+    run = await db.get(AgentRun, approval.run_id)
+    if session is None or run is None:
+        return []
+
+    run.status = "running"
+    await db.commit()
+    messages = list(
+        (
+            await db.scalars(
+                select(Message)
+                .where(Message.session_id == session.id)
+                .order_by(Message.id)
+            )
+        ).all()
+    )
+    prepared_context = await ContextManager(settings).build_context(
+        db,
+        project_id=session.project_id,
+        session_id=session.id,
+        prompt=run.prompt,
+        history=messages,
+    )
+    continuation_prompt = (
+        "Continue the original task from the approved tool result below. "
+        "The approved tool has already been executed; do not repeat that same call. "
+        "Inspect or modify the workspace as needed, then provide the final answer "
+        "for the user when the task is complete.\n\n"
+        f"Original user request:\n{run.prompt}\n\n"
+        f"Approved tool: {approval.tool_name}\n"
+        f"Approved tool result:\n{execution_result}"
+    )
+    workspace = str((WORKSPACE_ROOT / "projects" / str(session.project_id)).resolve())
+    continuation_events: list[dict] = []
+    waiting_for_approval = False
+
+    try:
+        async for event in run_agent(
+            continuation_prompt,
+            workspace,
+            history=None,
+            thread_id=f"session-{session.id}-approval-{approval.id}",
+            context_text=prepared_context.render(),
+        ):
+            event_payload = {
+                "run_id": run.id,
+                "type": event.type,
+                "content": event.content,
+                "tool": event.tool,
+            }
+            if event.type == "approval.required":
+                details: dict = {}
+                try:
+                    details = json.loads(event.content or "{}")
+                except json.JSONDecodeError:
+                    details = {}
+                tool_name = event.tool or details.get("tool") or "unknown"
+                arguments = details.get("arguments") or {}
+                try:
+                    tool_spec = get_tool(tool_name)
+                    risk_level = tool_spec.risk.level
+                    risk_reason = details.get("reason") or tool_spec.risk.reason
+                except Exception:
+                    risk_level = details.get("risk_level") or "medium"
+                    risk_reason = details.get("reason") or "需要人工确认后才能继续执行"
+                next_approval = Approval(
+                    run_id=run.id,
+                    session_id=session.id,
+                    tool_name=tool_name,
+                    arguments=json.dumps(arguments, ensure_ascii=False),
+                    risk_level=risk_level,
+                    risk_reason=risk_reason,
+                    target_path=arguments.get("path") if isinstance(arguments, dict) else None,
+                )
+                db.add(next_approval)
+                await db.flush()
+                waiting_for_approval = True
+                event_payload.update(
+                    {
+                        "approval_id": next_approval.id,
+                        "risk_level": next_approval.risk_level,
+                        "arguments": next_approval.arguments,
+                        "target_path": next_approval.target_path,
+                        "content": next_approval.risk_reason,
+                    }
+                )
+            db.add(
+                AgentEventRecord(
+                    run_id=run.id,
+                    event_type=event.type,
+                    content=event.content,
+                    tool=event.tool,
+                )
+            )
+            if event.type == "message.delta":
+                db.add(
+                    Message(
+                        session_id=session.id,
+                        role="assistant",
+                        content=event.content,
+                    )
+                )
+            if event.type == "run.finished":
+                run.status = "waiting_approval" if waiting_for_approval else "completed"
+            elif event.type == "run.failed":
+                run.status = "failed"
+            await db.commit()
+            continuation_events.append(event_payload)
+    except Exception as error:
+        run.status = "failed"
+        db.add(
+            AgentEventRecord(
+                run_id=run.id,
+                event_type="run.failed",
+                content=str(error),
+            )
+        )
+        await db.commit()
+        continuation_events.append(
+            {"run_id": run.id, "type": "run.failed", "content": str(error)}
+        )
+
+    if run.status == "completed":
+        await MemoryService(settings).extract_and_persist(
+            db,
+            run.prompt,
+            project_id=session.project_id,
+            session_id=session.id,
+            source_message_ids=[message.id for message in messages if message.role == "user"],
+            source_run_id=run.id,
+        )
+        await db.commit()
+    return continuation_events
+
+
+def _approval_response(
+    approval: Approval,
+    execution_result: str | None = None,
+    continuation_events: list[dict] | None = None,
+) -> dict:
+    return {
+        "id": approval.id,
+        "run_id": approval.run_id,
+        "session_id": approval.session_id,
+        "tool_name": approval.tool_name,
+        "arguments": approval.arguments,
+        "risk_level": approval.risk_level,
+        "risk_reason": approval.risk_reason,
+        "target_path": approval.target_path,
+        "status": approval.status,
+        "resolution_reason": approval.resolution_reason,
+        "execution_result": execution_result,
+        "continuation_events": continuation_events or [],
+    }
+
+
 async def resolve_approval(
     approval_id: int, status: str, reason: str | None, db: AsyncSession
 ):
-    approval = await _get_approval(approval_id, db)
+    approval = (
+        await db.scalars(
+            select(Approval).where(Approval.id == approval_id).with_for_update()
+        )
+    ).one_or_none()
+    if approval is None:
+        raise HTTPException(404, "Approval not found")
     if approval.status != "PENDING":
         raise HTTPException(409, "Approval is already resolved")
     approval.status = status
     approval.resolution_reason = reason
     approval.resolved_at = datetime.now(timezone.utc)
+    if status != "APPROVED":
+        session = await db.get(Session, approval.session_id)
+        if session is not None:
+            decision_label = "拒绝" if status == "REJECTED" else "取消"
+            db.add(
+                Message(
+                    session_id=session.id,
+                    role="system",
+                    content=f"已{decision_label}工具 {approval.tool_name} 的审批。",
+                )
+            )
     await db.commit()
     await db.refresh(approval)
-    return approval
+    execution_result = None
+    continuation_events: list[dict] = []
+    if status == "APPROVED":
+        execution_result = await _execute_approved_tool(approval, db)
+        continuation_events = await _continue_after_approval(
+            approval, execution_result, db
+        )
+    return _approval_response(approval, execution_result, continuation_events)
 
 
 class ApprovalDecision(BaseModel):

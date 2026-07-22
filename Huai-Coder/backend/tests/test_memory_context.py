@@ -7,8 +7,8 @@ from app.config import Settings
 from app.context import ContextManager, estimate_tokens
 from app.database import Base
 from app.agent import _bound_react_messages
-from app.memory import MemoryService, extract_candidates
-from app.models import Message, Project, Session
+from app.memory import GLOBAL_MEMORY_SCOPE_ID, MemoryService, extract_candidates
+from app.models import Memory, Message, Project, Session
 
 
 @pytest.fixture
@@ -75,6 +75,115 @@ async def test_memory_upsert_deduplicates_and_searches(db_session):
     found = await service.search(db_session, project_id=1, query="PostgreSQL 主库")
     assert len(found) == 1
     assert found[0].access_count == 1
+
+
+@pytest.mark.asyncio
+async def test_project_memory_overview_includes_global_memory(db_session):
+    db_session.add_all(
+        [
+            Memory(
+                scope_type="project",
+                scope_id=7,
+                memory_type="decision",
+                content="项目使用 PostgreSQL",
+                normalized_content="项目使用 postgresql",
+                importance=8,
+                confidence=0.9,
+                status="active",
+            ),
+            Memory(
+                scope_type="user",
+                scope_id=GLOBAL_MEMORY_SCOPE_ID,
+                memory_type="preference",
+                content="用户偏好中文回复",
+                normalized_content="用户偏好中文回复",
+                importance=7,
+                confidence=0.9,
+                status="active",
+            ),
+            Memory(
+                scope_type="project",
+                scope_id=99,
+                memory_type="fact",
+                content="其他项目记忆",
+                normalized_content="其他项目记忆",
+                importance=10,
+                confidence=0.9,
+                status="active",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    grouped = await MemoryService().list_project_and_global_memories(db_session, 7)
+
+    assert [memory.content for memory in grouped["project"]] == ["项目使用 PostgreSQL"]
+    assert [memory.content for memory in grouped["global"]] == ["用户偏好中文回复"]
+
+
+@pytest.mark.asyncio
+async def test_session_memory_overview_groups_session_project_and_user_memory(db_session):
+    project = Project(name="memory-overview-project")
+    db_session.add(project)
+    await db_session.flush()
+    session = Session(project_id=project.id, title="memory-overview-session")
+    db_session.add(session)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            Memory(
+                scope_type="session",
+                scope_id=session.id,
+                memory_type="task",
+                content="当前会话需要补充登录测试",
+                normalized_content="当前会话需要补充登录测试",
+                importance=8,
+                confidence=0.9,
+                status="active",
+            ),
+            Memory(
+                scope_type="project",
+                scope_id=project.id,
+                memory_type="decision",
+                content="项目采用 PostgreSQL",
+                normalized_content="项目采用 postgresql",
+                importance=7,
+                confidence=0.9,
+                status="active",
+            ),
+            Memory(
+                scope_type="user",
+                scope_id=GLOBAL_MEMORY_SCOPE_ID,
+                memory_type="preference",
+                content="用户偏好中文回复",
+                normalized_content="用户偏好中文回复",
+                importance=6,
+                confidence=0.9,
+                status="active",
+            ),
+            Memory(
+                scope_type="session",
+                scope_id=session.id + 100,
+                memory_type="fact",
+                content="其他会话记忆",
+                normalized_content="其他会话记忆",
+                importance=10,
+                confidence=0.9,
+                status="active",
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    grouped = await MemoryService().list_session_project_user_memories(
+        db_session, session.id, project.id
+    )
+
+    assert [memory.content for memory in grouped["session"]] == [
+        "当前会话需要补充登录测试"
+    ]
+    assert [memory.content for memory in grouped["project"]] == ["项目采用 PostgreSQL"]
+    assert [memory.content for memory in grouped["user"]] == ["用户偏好中文回复"]
 
 
 @pytest.mark.asyncio

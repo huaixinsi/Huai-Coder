@@ -103,6 +103,8 @@ POST   /api/sessions
 POST   /api/runs
 
 GET    /api/projects/{project_id}/memories
+GET    /api/projects/{project_id}/memories/overview
+GET    /api/sessions/{session_id}/memories/overview
 POST   /api/memories
 PATCH  /api/memories/{memory_id}
 DELETE /api/memories/{memory_id}

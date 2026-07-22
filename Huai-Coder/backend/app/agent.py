@@ -9,7 +9,7 @@ from .config import get_settings
 from .registry import get_tool, TOOLS
 from .llm import complete_with_tools
 from .agents.registry import list_subagents
-from .context import estimate_messages
+from .context import estimate_messages, estimate_tokens
 
 SENSITIVE_REQUEST_MARKERS = (
     ".env",
@@ -97,9 +97,6 @@ _CODE_EXTENSIONS = {
     ".sh",
     ".bat",
 }
-
-MAX_REACT_TURNS = 15
-
 
 def _bound_react_messages(messages: list[dict], max_tokens: int) -> list[dict]:
     """Keep the tool loop inside the model budget without breaking tool pairs."""
@@ -311,9 +308,27 @@ async def _execute(state: AgentState) -> AgentState:
     final_answer = ""
     repeated_call: tuple[str, str] | None = None
     repeated_count = 0
-    for turn in range(MAX_REACT_TURNS):
-        messages = _bound_react_messages(messages, get_settings().context_max_tokens)
+    settings = get_settings()
+    token_budget = max(1, settings.agent_token_budget)
+    tokens_used = 0
+    while True:
+        messages = _bound_react_messages(messages, settings.context_max_tokens)
+        request_tokens = estimate_messages(messages)
+        if tokens_used and tokens_used + request_tokens > token_budget:
+            final_answer = (
+                f"本轮已达到 Agent Token 预算（{token_budget}），已停止继续调用工具。\n\n"
+                "已保留当前会话上下文；你可以继续发送下一步要求，或将任务拆分成更小的步骤。"
+            )
+            events.append(AgentEvent("message.delta", final_answer))
+            break
+        tokens_used += request_tokens
         response = await complete_with_tools(messages, tool_schemas, timeout=120)
+        response_tokens = estimate_tokens(response.content or "")
+        if response.tool_call is not None:
+            response_tokens += estimate_tokens(
+                json.dumps(response.tool_call.arguments, ensure_ascii=False)
+            )
+        tokens_used += response_tokens
 
         # No tool call -> final answer
         if response.tool_call is None:
@@ -382,13 +397,6 @@ async def _execute(state: AgentState) -> AgentState:
             "tool_call_id": tc.id,
             "content": str(result)[:8000],
         })
-    else:
-        final_answer = (
-            f"本轮已完成 {MAX_REACT_TURNS} 次工具调用，但任务尚未完成。\n\n"
-            "已保留当前会话上下文；你可以继续发送下一步要求，或将任务拆分成更小的步骤。"
-        )
-        events.append(AgentEvent("message.delta", final_answer))
-
     events.append(AgentEvent("run.finished"))
     return {**state, "response": final_answer, "events": events}
 

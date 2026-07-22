@@ -23,6 +23,7 @@ type Activity = { type: string; tool?: string; arguments?: string; content?: str
 type ChatMessage = { id: string; role: "user" | "assistant" | "system"; content: string; activities: Activity[]; status?: "running" | "done" | "failed" };
 type Approval = StreamEvent;
 type DirectoryFile = { file: File; relativePath: string };
+type RunStatus = "idle" | "running" | "waiting" | "completed" | "failed" | "stopped";
 
 declare global {
   interface Window { showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<FileSystemDirectoryHandle>; }
@@ -39,7 +40,7 @@ function Markdown({ value }: { value: string }) {
 function ActivityList({ activities }: { activities: Activity[] }) {
   if (!activities.length) return null;
   const toolCalls = activities.filter(activity => activity.type === "tool");
-  const finished = toolCalls.filter(activity => activity.status === "done").length;
+  const finished = toolCalls.filter(activity => activity.status !== "running").length;
   const formatArguments = (value?: string) => {
     if (!value) return "";
     try { return JSON.stringify(JSON.parse(value).arguments ?? JSON.parse(value), null, 2); } catch { return value; }
@@ -47,7 +48,7 @@ function ActivityList({ activities }: { activities: Activity[] }) {
   return <details className="execution-panel" open={activities.some(activity => activity.status === "running")}>
     <summary><span className="activity-dot" />执行过程 - {toolCalls.length} 次工具调用<span className="activity-status">已完成 {finished}/{toolCalls.length}</span></summary>
     <div className="activity-list">{activities.map((activity, index) => activity.type === "context.compacted" ? <div className="context-note" key={`context-${index}`}>上下文已压缩：{activity.content}</div> : <details className={`activity ${activity.status}`} key={`${activity.type}-${activity.tool ?? ""}-${index}`}>
-      <summary><span className="activity-dot" />{index + 1}. {activity.tool ?? "工具调用"}<span className="activity-status">{activity.status === "running" ? "进行中" : "已完成"}</span></summary>
+      <summary><span className="activity-dot" />{index + 1}. {activity.tool ?? "工具调用"}<span className="activity-status">{activity.status === "running" ? "进行中" : activity.status === "error" ? "失败" : "已完成"}</span></summary>
       <div className="activity-body">
         {activity.arguments && <><label>参数</label><pre>{formatArguments(activity.arguments)}</pre></>}
         {activity.content && <><label>结果</label><pre>{activity.content}</pre></>}
@@ -59,6 +60,7 @@ function ActivityList({ activities }: { activities: Activity[] }) {
 function App() {
   const [prompt, setPrompt] = useState("");
   const [running, setRunning] = useState(false);
+  const [runStatus, setRunStatus] = useState<RunStatus>("idle");
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectName, setProjectName] = useState("");
   const [selectedProject, setSelectedProject] = useState<number | null>(null);
@@ -68,6 +70,9 @@ function App() {
   const [folderName, setFolderName] = useState("");
   const [uploading, setUploading] = useState(false);
   const [approval, setApproval] = useState<Approval | null>(null);
+  const [approvalAssistantId, setApprovalAssistantId] = useState<string | null>(null);
+  const [approvalError, setApprovalError] = useState("");
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const [plan, setPlan] = useState<PlanSummary | null>(null);
   const [planTasks, setPlanTasks] = useState<PlanTask[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -85,7 +90,7 @@ function App() {
   }
 
   async function selectProject(id: number) {
-    setSelectedProject(id); setFolderName(""); setChatMessages([]); setSelectedSession(null); setPlan(null); setPlanTasks([]); await loadMemories(id);
+    setSelectedProject(id); setFolderName(""); setChatMessages([]); setSelectedSession(null); setPlan(null); setPlanTasks([]); setRunStatus("idle"); await loadMemories(id);
     const r = await fetch(`${API}/api/projects/${id}/sessions`);
     const list: ChatSession[] = r.ok ? await r.json() : [];
     setSessions(list);
@@ -93,7 +98,7 @@ function App() {
   }
 
   async function selectSession(id: number) {
-    setSelectedSession(id);
+    setSelectedSession(id); setRunStatus("idle");
     const r = await fetch(`${API}/api/sessions/${id}/messages`);
     if (!r.ok) return;
     const messages = await r.json();
@@ -179,19 +184,44 @@ function App() {
       });
       return;
     }
-    if (item.type === "approval.required") { setApproval(item); return; }
-    if (item.type === "run.finished") { updateMessage(assistantId, message => ({ ...message, status: "done" })); return; }
-    if (item.type === "run.failed") { updateMessage(assistantId, message => ({ ...message, status: "failed", content: message.content || item.content || "本次运行失败，请查看执行过程。" })); return; }
+    if (item.type === "approval.required") {
+      let details: Record<string, unknown> = {};
+      try { details = JSON.parse(item.content ?? "{}"); } catch { /* backend may already provide normalized approval fields */ }
+      const approvalArguments = item.arguments ?? (details.arguments ? JSON.stringify(details.arguments, null, 2) : "{}");
+      setApproval({
+        ...item,
+        approval_id: item.approval_id ?? (typeof details.approval_id === "number" ? details.approval_id : undefined),
+        tool: item.tool ?? (typeof details.tool === "string" ? details.tool : undefined),
+        risk_level: item.risk_level ?? (typeof details.risk_level === "string" ? details.risk_level : undefined),
+        arguments: approvalArguments,
+        target_path: item.target_path ?? (typeof details.target_path === "string" ? details.target_path : undefined),
+        content: item.content && !item.approval_id && typeof details.reason === "string" ? details.reason : item.content,
+      });
+      setApprovalAssistantId(assistantId);
+      setRunStatus("waiting");
+      setApprovalError("");
+      return;
+    }
+    if (item.type === "run.finished") {
+      updateMessage(assistantId, message => ({ ...message, status: "done" }));
+      setRunStatus(current => current === "waiting" ? current : "completed");
+      return;
+    }
+    if (item.type === "run.failed") {
+      updateMessage(assistantId, message => ({ ...message, status: "failed", content: message.content || item.content || "本次运行失败，请查看执行过程。" }));
+      setRunStatus("failed");
+      return;
+    }
     if (item.type === "plan.created" && item.plan_id) { setPlan({ id: item.plan_id, summary: item.content, status: "WAITING_CONFIRMATION" }); return; }
     if (item.type === "plan.confirmation_required") { setPlan(current => current ? { ...current, goal: item.content } : current); }
   }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!prompt.trim() || running || !selectedProject || !selectedSession) return;
+    if (!prompt.trim() || running || approval || !selectedProject || !selectedSession) return;
     const value = prompt.trim();
     const assistantId = `assistant-${Date.now()}`;
-    setPrompt(""); setRunning(true);
+    setPrompt(""); setRunning(true); setRunStatus("running");
     setChatMessages(current => [...current, { id: `user-${Date.now()}`, role: "user", content: value, activities: [], status: "done" }, { id: assistantId, role: "assistant", content: "", activities: [], status: "running" }]);
     try {
       const response = await fetch(`${API}/api/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: value, project_id: selectedProject, session_id: selectedSession }) });
@@ -217,6 +247,7 @@ function App() {
       buffer += decoder.decode();
       if (buffer.trim()) consume(buffer);
     } catch (error) {
+      setRunStatus("failed");
       updateMessage(assistantId, message => ({ ...message, status: "failed", content: error instanceof Error ? error.message : "请求失败" }));
     } finally { setRunning(false); }
   }
@@ -229,8 +260,61 @@ function App() {
   async function chooseFolder() { if (!selectedProject || uploading || !window.showDirectoryPicker) return; try { const handle = await window.showDirectoryPicker({ mode: "read" }); await uploadBatch(await collectDirectory(handle), handle.name); } catch (error) { if (!(error instanceof DOMException && error.name === "AbortError")) console.error(error); } }
   async function uploadFiles(event: React.ChangeEvent<HTMLInputElement>) { if (!selectedProject || !event.target.files?.length) return; const data = new FormData(); Array.from(event.target.files).forEach(file => { data.append("files", file); data.append("relative_paths", file.name); }); setUploading(true); try { const r = await fetch(`${API}/api/projects/${selectedProject}/files`, { method: "POST", body: data }); if (r.ok) setFolderName(`${event.target.files.length} 个文件`); } finally { setUploading(false); event.target.value = ""; } }
   async function planAction(action: "confirm" | "cancel" | "pause" | "resume") { if (!plan) return; const r = await fetch(`${API}/api/plans/${plan.id}/${action}`, { method: "POST" }); if (r.ok) setPlan(await r.json()); }
-  async function decideApproval(action: "approve" | "reject" | "cancel") { if (!approval?.approval_id) return; await fetch(`${API}/api/approvals/${approval.approval_id}/${action}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }); setApproval(null); }
+  async function decideApproval(action: "approve" | "reject" | "cancel") {
+    if (!approval?.approval_id) { setApprovalError("审批记录缺少 ID，请刷新页面后重新发起任务。"); return; }
+    if (approvalBusy) return;
+    setApprovalBusy(true); setRunning(true); setRunStatus("running");
+    try {
+      const response = await fetch(`${API}/api/approvals/${approval.approval_id}/${action}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
+      if (!response.ok) throw new Error(`审批请求失败（${response.status}）`);
+      const result = await response.json() as { execution_result?: string | null; continuation_events?: StreamEvent[] };
+      const activeApproval = approval;
+      const activeAssistantId = approvalAssistantId;
+      setApproval(null);
+      setApprovalAssistantId(null);
+      setApprovalError("");
+      const actionLabel = action === "approve" ? "批准" : action === "reject" ? "拒绝" : "取消";
+      const resultText = action === "approve" && result.execution_result ? `\n\n执行结果：\n${result.execution_result}` : "";
+      const failed = action === "approve" && (result.execution_result ?? "").startsWith("审批后执行失败");
+      const activityStatus: Activity["status"] = action === "approve" && !failed ? "done" : "error";
+      const activityContent = action === "approve" ? (result.execution_result || "工具已执行。") : `审批已${actionLabel}，工具未执行。`;
+      setChatMessages(current => {
+        const updated = activeAssistantId
+          ? current.map(message => {
+              if (message.id !== activeAssistantId) return message;
+              const activities = [...message.activities];
+              const index = [...activities].reverse().findIndex(activity => activity.type === "tool" && activity.tool === activeApproval?.tool && activity.status === "running");
+              const target = index < 0 ? -1 : activities.length - 1 - index;
+              if (target >= 0) activities[target] = { ...activities[target], content: activityContent, status: activityStatus };
+              return { ...message, activities };
+            })
+          : current;
+        return [...updated, { id: `approval-${Date.now()}`, role: "system", content: `已${actionLabel}本次工具调用审批。${resultText}`, activities: [], status: "done" }];
+      });
+      const continuationEvents = result.continuation_events ?? [];
+      for (const event of continuationEvents) handleStreamEvent(event, activeAssistantId ?? "");
+      if (continuationEvents.length === 0) setRunStatus(action === "approve" ? "completed" : "stopped");
+      if (action !== "approve") setRunStatus("stopped");
+    } catch (error) {
+      setRunStatus("failed");
+      setApprovalError(error instanceof Error ? error.message : "审批请求失败，请稍后重试。");
+    } finally {
+      setApprovalBusy(false); setRunning(false);
+    }
+  }
   async function copyMessage(content: string) { await navigator.clipboard?.writeText(content); }
+
+  const statusView = approval
+    ? { kind: "waiting", label: "等待确认" }
+    : runStatus === "running"
+      ? { kind: "running", label: "进行中" }
+      : runStatus === "completed"
+        ? { kind: "completed", label: "已完成" }
+        : runStatus === "failed"
+          ? { kind: "failed", label: "执行失败" }
+          : runStatus === "stopped"
+            ? { kind: "stopped", label: "已停止" }
+            : { kind: "idle", label: "就绪" };
 
   return <main>
     <header><div><h1>Huai-Coder</h1><span>Project Workspace Agent</span></div><div className="header-badge">安全执行 · 可追踪上下文</div></header>
@@ -246,11 +330,12 @@ function App() {
         <div className="feature-card"><strong>计划执行</strong><span>确认后按依赖逐步执行任务</span></div>
         <div className="feature-card"><strong>工具可追踪</strong><span>查看每次调用的参数和结果</span></div>
       </div>
+      <div className="hero-art" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="hero-mascot">麻</span><span className="hero-star star-one">✦</span><span className="hero-star star-two">✧</span></div>
     </section>
     <section className="projects panel"><h2>项目与会话</h2><div className="project-create"><input value={projectName} onChange={event => setProjectName(event.target.value)} placeholder="新建项目" /><button onClick={createProject}>创建</button></div><ul className="project-list">{projects.map(project => <li key={project.id} className={selectedProject === project.id ? "selected" : ""} onClick={() => selectProject(project.id)}><span>{project.name}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteProject(project.id); }}>删除</button></li>)}</ul>{selectedProject && <div className="project-tools"><div className="session-create"><input value={sessionTitle} onChange={event => setSessionTitle(event.target.value)} placeholder="新会话名称" /><button onClick={createSession}>新建会话</button></div><ul className="session-list">{sessions.map(session => <li key={session.id} className={selectedSession === session.id ? "selected" : ""} onClick={() => selectSession(session.id)}><span>{session.title}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteSession(session.id); }}>删除</button></li>)}</ul><div className="folder-area"><button type="button" className="secondary-button" onClick={chooseFolder} disabled={uploading}>{uploading ? "上传中…" : "选择完整文件夹"}</button><label className="secondary-button">选择文件<input type="file" multiple onChange={uploadFiles} disabled={uploading} /></label>{folderName && <span className="folder-name">最近上传：{folderName}</span>}</div><div className="memory-panel"><div className="section-heading"><div><h3>长期记忆</h3><p>只保存可复用的项目事实、决策和约束</p></div><button className="secondary-button" type="button" onClick={compactSelectedSession} disabled={!selectedSession || memoryBusy}>压缩会话</button></div><div className="memory-create"><select value={memoryType} onChange={event => setMemoryType(event.target.value)}><option value="fact">事实</option><option value="decision">决策</option><option value="preference">偏好</option><option value="constraint">约束</option><option value="task">待办</option></select><input value={memoryContent} onChange={event => setMemoryContent(event.target.value)} placeholder="保存一条项目记忆" /><button type="button" onClick={createMemory} disabled={memoryBusy || !memoryContent.trim()}>保存</button></div><ul className="memory-list">{memories.length === 0 ? <li className="muted">暂无项目记忆</li> : memories.map(memory => <li key={memory.id}><span><small>{memory.memory_type} · 重要性 {memory.importance}</small>{memory.content}</span><button type="button" className="delete-button" onClick={() => removeMemory(memory.id)}>删除</button></li>)}</ul></div></div>}</section>
     {plan && <section className="plan-panel panel"><div className="section-heading"><div><h2>执行计划</h2><p>{plan.goal}</p></div><span className="status-pill">{plan.status}</span></div><p>{plan.summary}</p><div className="plan-tasks">{planTasks.length === 0 ? <p className="muted">正在加载任务列表…</p> : planTasks.map((task, index) => <article key={task.id}><strong>{index + 1}. {task.title}</strong><small>{task.task_key} · {task.task_type} · {task.status} · 重试 {task.retry_count}/2</small><div>{task.description}</div>{task.output_data && <pre>{task.output_data}</pre>}{task.error_message && <pre>{task.error_message}</pre>}</article>)}</div><div className="action-row"><button onClick={() => planAction("confirm")} disabled={plan.status !== "WAITING_CONFIRMATION"}>确认计划</button><button onClick={() => planAction("cancel")} disabled={plan.status === "SUCCEEDED" || plan.status === "CANCELLED"}>取消计划</button><button onClick={() => planAction("pause")} disabled={plan.status !== "RUNNING"}>暂停</button><button onClick={() => planAction("resume")} disabled={plan.status !== "PAUSED"}>继续</button></div></section>}
-    <section className="chat panel"><div className="chat-heading"><div><h2>对话</h2><p>助手回复支持 Markdown；工具调用和上下文压缩显示在执行过程里</p></div>{running && <span className="running-pill"><i />处理中</span>}</div><div className="timeline">{chatMessages.length === 0 && <p className="empty">选择项目和会话后，开始向 Agent 提问。</p>}{chatMessages.map(message => <article className={`chat-message ${message.role} ${message.status ?? ""}`} key={message.id}><div className="message-head"><span className="role-label">{message.role === "user" ? "你" : message.role === "assistant" ? "Huai-Coder" : "系统"}</span>{message.role === "assistant" && message.content && <button className="copy-button" onClick={() => copyMessage(message.content)}>复制</button>}</div><ActivityList activities={message.activities} />{message.content ? <div className="message-content"><Markdown value={message.content} /></div> : message.status === "running" && <div className="typing"><i /><i /><i />正在思考…</div>}{message.status === "failed" && <div className="message-error">本次运行未完成，可以继续发送指令。</div>}</article>)}</div><form onSubmit={submit}><input value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="描述你要完成的任务…" disabled={running || !selectedSession} /><button disabled={running || !selectedSession}>{running ? "处理中…" : "发送"}</button></form></section>
-    {approval && <div className="approval-modal"><div className="approval-card"><h2>需要审批：{approval.tool}</h2><p>风险等级：{approval.risk_level}</p><p>{approval.content}</p><pre>{approval.arguments}</pre><p>目标：{approval.target_path}</p><div className="action-row"><button onClick={() => decideApproval("approve")}>批准</button><button onClick={() => decideApproval("reject")}>拒绝</button><button onClick={() => decideApproval("cancel")}>取消</button></div></div></div>}
+    <section className="chat panel"><div className="chat-heading"><div><h2>对话</h2><p>助手回复支持 Markdown；工具调用和上下文压缩显示在执行过程里</p></div><button type="button" className={`run-status ${statusView.kind}`} aria-live="polite" disabled><span className="run-status-icon" aria-hidden="true" />{statusView.label}</button></div><div className="timeline">{chatMessages.length === 0 && <p className="empty">选择项目和会话后，开始向 Agent 提问。</p>}{chatMessages.map(message => <article className={`chat-message ${message.role} ${message.status ?? ""}`} key={message.id}><div className="message-head"><span className="role-label">{message.role === "user" ? "你" : message.role === "assistant" ? "Huai-Coder" : "系统"}</span>{message.role === "assistant" && message.content && <button className="copy-button" onClick={() => copyMessage(message.content)}>复制</button>}</div><ActivityList activities={message.activities} />{message.content ? <div className="message-content"><Markdown value={message.content} /></div> : message.status === "running" && <div className="typing"><i /><i /><i />正在思考…</div>}{message.status === "failed" && <div className="message-error">本次运行未完成，可以继续发送指令。</div>}</article>)}</div><form onSubmit={submit}><input value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="描述你要完成的任务…" disabled={running || !selectedSession} /><button disabled={running || !selectedSession}>{running ? "处理中…" : "发送"}</button></form></section>
+    {approval && <div className="approval-modal"><div className="approval-card"><h2>需要审批：{approval.tool}</h2><p>风险等级：{approval.risk_level ?? "未标注"}</p><p>{approval.content}</p><pre>{approval.arguments}</pre><p>目标：{approval.target_path || "当前项目工作区"}</p>{approvalError && <p className="approval-error">{approvalError}</p>}<div className="action-row"><button onClick={() => decideApproval("approve")} disabled={approvalBusy}>{approvalBusy ? "处理中…" : "批准"}</button><button onClick={() => decideApproval("reject")} disabled={approvalBusy}>拒绝</button><button onClick={() => decideApproval("cancel")} disabled={approvalBusy}>取消</button></div></div></div>}
   </main>;
 }
 
