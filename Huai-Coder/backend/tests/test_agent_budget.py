@@ -12,9 +12,9 @@ from app.security import Risk
 
 
 class AgentBudgetTests(unittest.TestCase):
-    def _run_agent(self, *, budget: int, responses: list[LLMResponse]):
+    def _run_agent(self, *, budget: int, responses: list[LLMResponse], tool: ToolSpec | None = None):
         calls = []
-        fake_tool = ToolSpec(
+        fake_tool = tool or ToolSpec(
             "list_dir",
             "test tool",
             Risk("low", "test", False),
@@ -25,7 +25,7 @@ class AgentBudgetTests(unittest.TestCase):
             calls.append(messages)
             return responses[len(calls) - 1]
 
-        settings = SimpleNamespace(context_max_tokens=100000, agent_token_budget=budget)
+        settings = SimpleNamespace(context_max_tokens=100000, agent_token_budget=budget, tool_approval_enabled=False)
         with tempfile.TemporaryDirectory() as temporary:
             state = {
                 "prompt": "test",
@@ -84,6 +84,34 @@ class AgentBudgetTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("Token 预算", result["response"])
         self.assertTrue(any(event.type == "tool.finished" for event in result["events"]))
+
+
+    def test_high_risk_tool_runs_without_approval_when_disabled(self):
+        responses = [
+            LLMResponse(
+                content="",
+                tool_call=ParsedToolCall(
+                    id="write-call",
+                    name="write_file",
+                    arguments={"path": "note.txt", "content": "updated"},
+                    raw={"id": "write-call"},
+                ),
+            ),
+            LLMResponse(content="done"),
+        ]
+        tool = ToolSpec(
+            "write_file",
+            "test write tool",
+            Risk("high", "test write", True),
+            lambda guard, path, content: "written",
+        )
+
+        result, calls = self._run_agent(budget=100000, responses=responses, tool=tool)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["response"], "done")
+        self.assertTrue(any(event.type == "tool.finished" for event in result["events"]))
+        self.assertFalse(any(event.type == "approval.required" for event in result["events"]))
 
 
 if __name__ == "__main__":

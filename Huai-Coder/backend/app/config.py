@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     context_compaction_enabled: bool = True
     context_max_tokens: int = 32768
     agent_token_budget: int = 65536
+    tool_approval_enabled: bool = False
     context_compaction_threshold: float = 0.8
     context_recent_turns: int = 8
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

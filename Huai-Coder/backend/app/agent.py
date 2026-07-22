@@ -158,9 +158,14 @@ def _workspace_context(root: Path) -> str:
     )
 
 
-def _build_system_prompt(context: str) -> str:
+def _build_system_prompt(context: str, tool_approval_enabled: bool = True) -> str:
     """Build the main agent system prompt with tool descriptions and sub-agent list."""
     agents_desc = json.dumps(list_subagents(), ensure_ascii=False, indent=2)
+    approval_note = (
+        "Project tool approvals are temporarily disabled. Execute tools directly within the workspace."
+        if not tool_approval_enabled
+        else "High-risk tools require explicit user approval before execution."
+    )
     return (
         "You are a coding assistant working inside a project workspace. "
         "You have tools to inspect and modify the project. Use them when needed.\n\n"
@@ -168,8 +173,8 @@ def _build_system_prompt(context: str) -> str:
         "- list_dir(path): List files in a directory\n"
         "- read_file(path): Read a file's content\n"
         "- grep_code(query, path): Search for text in source files\n"
-        "- write_file(path, content): Write content to a file (requires approval)\n"
-        "- execute_command(command): Run a shell command (requires approval)\n"
+        "- write_file(path, content): Write content to a file\n"
+        "- execute_command(command): Run a shell command\n"
         "- task(agent_name, task): Delegate to a sub-agent\n\n"
         "## Sub-Agents\n"
         f"{agents_desc}\n\n"
@@ -177,8 +182,9 @@ def _build_system_prompt(context: str) -> str:
         "1. Use read-only tools first to understand the project before making changes.\n"
         "2. For complex tasks, delegate to sub-agents via the 'task' tool.\n"
         "3. Never output secrets, passwords, tokens, or credentials.\n"
-        "4. If the user asks about sensitive config (.env etc), explain that explicit approval is needed.\n"
-        "5. When done, provide a clear final answer without tool calls.\n\n"
+        f"4. {approval_note}\n"
+        "5. Keep all file paths inside the selected project workspace.\n"
+        "6. When done, provide a clear final answer without tool calls.\n\n"
         f"## Project Context\n{context}"
     )
 
@@ -287,9 +293,10 @@ async def _execute(state: AgentState) -> AgentState:
     agent_prompt = state.get("prompt") or user_prompt
     workspace = state.get("workspace", ".")
     events: list[AgentEvent] = [AgentEvent("run.started")]
+    settings = get_settings()
 
     # Sensitive request guard
-    if any(marker in user_prompt.lower() for marker in SENSITIVE_REQUEST_MARKERS):
+    if settings.tool_approval_enabled and any(marker in user_prompt.lower() for marker in SENSITIVE_REQUEST_MARKERS):
         msg = "敏感配置不会被自动读取或回显。若需要访问，请使用 read_file 工具读取 .env，系统会先请求你的明确批准。"
         events.append(AgentEvent("message.delta", msg))
         events.append(AgentEvent("run.finished"))
@@ -297,7 +304,7 @@ async def _execute(state: AgentState) -> AgentState:
 
     guard = PathGuard(Path(workspace))
     context = _workspace_context(Path(workspace))
-    system_prompt = _build_system_prompt(context)
+    system_prompt = _build_system_prompt(context, settings.tool_approval_enabled)
     tool_schemas = _build_tool_schemas()
 
     messages: list[dict] = [
@@ -308,7 +315,6 @@ async def _execute(state: AgentState) -> AgentState:
     final_answer = ""
     repeated_call: tuple[str, str] | None = None
     repeated_count = 0
-    settings = get_settings()
     token_budget = max(1, settings.agent_token_budget)
     tokens_used = 0
     while True:
@@ -364,7 +370,7 @@ async def _execute(state: AgentState) -> AgentState:
             handler = tool_spec.handler
 
             # Approval gate for high-risk tools
-            if tool_spec.risk.requires_approval:
+            if settings.tool_approval_enabled and tool_spec.risk.requires_approval:
                 events.append(
                     AgentEvent(
                         "approval.required",
