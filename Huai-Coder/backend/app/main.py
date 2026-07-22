@@ -218,6 +218,30 @@ async def get_project_workspace(project_id: int, db: AsyncSession = Depends(get_
     }
 
 
+@app.get("/api/projects/{project_id}/workspace/files")
+async def list_project_workspace_files(project_id: int, db: AsyncSession = Depends(get_db)):
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
+    root = (WORKSPACE_ROOT / "projects" / str(project_id)).resolve()
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next", "coverage"}
+    skip_extensions = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".war", ".pdf", ".lock"}
+    files = []
+    if root.exists():
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or any(part in skip_dirs or part.endswith(".egg-info") for part in path.parts):
+                continue
+            if path.name.startswith(".") and path.name != ".env.example":
+                continue
+            if path.suffix.lower() in skip_extensions or path.stat().st_size > 1024 * 1024:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            files.append({"path": str(path.relative_to(root)).replace("\\", "/"), "content": content})
+    return {"project_id": project_id, "files": files}
+
+
 @app.get("/api/projects/{project_id}/sessions")
 async def list_sessions(project_id: int, db: AsyncSession = Depends(get_db)):
     return (
