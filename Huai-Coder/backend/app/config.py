@@ -9,6 +9,15 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    memory_enabled: bool = True
+    memory_extraction_enabled: bool = True
+    memory_max_retrieved: int = 8
+    memory_default_importance: int = 5
+    memory_retention_days: int = 90
+    context_compaction_enabled: bool = True
+    context_max_tokens: int = 32768
+    context_compaction_threshold: float = 0.8
+    context_recent_turns: int = 8
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     @property
     def cors_origin_list(self) -> list[str]:

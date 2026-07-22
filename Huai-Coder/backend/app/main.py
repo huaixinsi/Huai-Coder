@@ -1,3 +1,10 @@
+import sys
+import asyncio
+
+# Windows: psycopg requires SelectorEventLoop, not the default ProactorEventLoop
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,10 +13,11 @@ from pydantic import BaseModel, Field
 import json
 import os
 import shutil
-import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from .agent import run_agent
+from .agent import AgentEvent, run_agent
+from .context import ContextManager
+from .memory import MEMORY_TYPES, MemoryCandidate, MemoryService
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
@@ -20,15 +28,14 @@ from .models import (
     Approval,
     AuditLog,
     Message,
+    Memory,
+    MemoryAudit,
+    ConversationSummary,
     Plan,
     Task,
-    TaskDependency,
     Project,
     Session,
 )
-from .registry import get_tool, command_risk
-from .security import PathGuard, scrub, WorkspaceViolation
-from .planner import create_plan
 from .executor import (
     mark_task_started,
     mark_task_success,
@@ -100,6 +107,26 @@ class MessageRequest(BaseModel):
     session_id: int
     role: str = Field(pattern="^(user|assistant|system)$")
     content: str = Field(min_length=1)
+
+
+class MemoryCreateRequest(BaseModel):
+    project_id: int
+    session_id: int | None = None
+    scope_type: str = Field(default="project", pattern="^(project|session)$")
+    memory_type: str = Field(default="fact", pattern="^(fact|preference|decision|constraint|task|summary)$")
+    content: str = Field(min_length=6, max_length=4000)
+    importance: int = Field(default=5, ge=1, le=10)
+    confidence: float = Field(default=0.9, ge=0, le=1)
+    expires_at: datetime | None = None
+
+
+class MemoryPatchRequest(BaseModel):
+    content: str | None = Field(default=None, min_length=6, max_length=4000)
+    memory_type: str | None = Field(default=None, pattern="^(fact|preference|decision|constraint|task|summary)$")
+    importance: int | None = Field(default=None, ge=1, le=10)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    expires_at: datetime | None = None
+    status: str | None = Field(default=None, pattern="^(active|deleted)$")
 
 
 @app.get("/api/projects")
@@ -193,6 +220,149 @@ async def list_messages(session_id: int, db: AsyncSession = Depends(get_db)):
     ).all()
 
 
+def _memory_payload(memory: Memory) -> dict:
+    return {
+        "id": memory.id,
+        "scope_type": memory.scope_type,
+        "scope_id": memory.scope_id,
+        "memory_type": memory.memory_type,
+        "content": memory.content,
+        "importance": memory.importance,
+        "confidence": float(memory.confidence),
+        "status": memory.status,
+        "source_session_id": memory.source_session_id,
+        "source_message_ids": memory.source_message_ids or [],
+        "source_run_id": memory.source_run_id,
+        "access_count": memory.access_count,
+        "expires_at": memory.expires_at,
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+    }
+
+
+async def _validate_memory_scope(
+    project_id: int, session_id: int | None, scope_type: str, db: AsyncSession
+) -> None:
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
+    if scope_type == "session":
+        if session_id is None:
+            raise HTTPException(400, "session_id is required for session memory")
+        session = await db.get(Session, session_id)
+        if session is None or session.project_id != project_id:
+            raise HTTPException(400, "Session does not belong to project")
+
+
+@app.get("/api/projects/{project_id}/memories")
+async def list_project_memories(
+    project_id: int,
+    scope_type: str | None = None,
+    memory_type: str | None = None,
+    status: str = "active",
+    db: AsyncSession = Depends(get_db),
+):
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
+    query = select(Memory).where(Memory.scope_type == "project", Memory.scope_id == project_id)
+    if status:
+        query = query.where(Memory.status == status)
+    if memory_type:
+        if memory_type not in MEMORY_TYPES:
+            raise HTTPException(400, "Unsupported memory type")
+        query = query.where(Memory.memory_type == memory_type)
+    rows = list((await db.scalars(query.order_by(Memory.importance.desc(), Memory.id.desc()))).all())
+    if scope_type == "session":
+        sessions = list((await db.scalars(select(Session.id).where(Session.project_id == project_id))).all())
+        if sessions:
+            session_rows = list((await db.scalars(select(Memory).where(Memory.scope_type == "session", Memory.scope_id.in_(sessions), Memory.status == status))).all())
+            rows.extend(session_rows)
+    return [_memory_payload(memory) for memory in rows]
+
+
+@app.post("/api/memories", status_code=201)
+async def create_memory(request: MemoryCreateRequest, db: AsyncSession = Depends(get_db)):
+    await _validate_memory_scope(request.project_id, request.session_id, request.scope_type, db)
+    service = MemoryService(settings)
+    candidate = MemoryCandidate(
+        scope_type=request.scope_type,
+        scope_id=request.session_id if request.scope_type == "session" else request.project_id,
+        memory_type=request.memory_type,
+        content=request.content,
+        importance=request.importance,
+        confidence=request.confidence,
+        source_session_id=request.session_id,
+        expires_at=request.expires_at,
+    )
+    memory = await service.upsert(db, candidate, reason="manual creation")
+    if memory is None:
+        raise HTTPException(400, "Sensitive information cannot be stored as memory")
+    await db.commit()
+    await db.refresh(memory)
+    return _memory_payload(memory)
+
+
+@app.patch("/api/memories/{memory_id}")
+async def update_memory(memory_id: int, request: MemoryPatchRequest, db: AsyncSession = Depends(get_db)):
+    memory = await db.get(Memory, memory_id)
+    if memory is None:
+        raise HTTPException(404, "Memory not found")
+    if request.content is not None:
+        from .memory import contains_sensitive, normalize_content
+        if contains_sensitive(request.content):
+            raise HTTPException(400, "Sensitive information cannot be stored as memory")
+        memory.content = request.content
+        memory.normalized_content = normalize_content(request.content)
+    if request.memory_type is not None:
+        memory.memory_type = request.memory_type
+    if request.importance is not None:
+        memory.importance = request.importance
+    if request.confidence is not None:
+        memory.confidence = request.confidence
+    if request.expires_at is not None:
+        memory.expires_at = request.expires_at
+    if request.status is not None:
+        memory.status = request.status
+    db.add(MemoryAudit(memory_id=memory.id, action="update", after_content=memory.content, reason="manual update"))
+    await db.commit()
+    await db.refresh(memory)
+    return _memory_payload(memory)
+
+
+@app.delete("/api/memories/{memory_id}", status_code=204)
+async def delete_memory(memory_id: int, db: AsyncSession = Depends(get_db)):
+    memory = await db.get(Memory, memory_id)
+    if memory is None:
+        raise HTTPException(404, "Memory not found")
+    await MemoryService(settings).delete(db, memory)
+    await db.commit()
+
+
+@app.get("/api/sessions/{session_id}/summary")
+async def get_session_summary(session_id: int, db: AsyncSession = Depends(get_db)):
+    if await db.get(Session, session_id) is None:
+        raise HTTPException(404, "Session not found")
+    summary = await ContextManager(settings).latest_summary(db, session_id)
+    return summary or {"summary": "", "covered_until_message_id": None, "token_count": 0}
+
+
+@app.post("/api/sessions/{session_id}/compact")
+async def compact_session(session_id: int, db: AsyncSession = Depends(get_db)):
+    if await db.get(Session, session_id) is None:
+        raise HTTPException(404, "Session not found")
+    messages = list((await db.scalars(select(Message).where(Message.session_id == session_id).order_by(Message.id))).all())
+    summary = await ContextManager(settings).compact_session(db, session_id, messages)
+    await db.commit()
+    if summary is None:
+        return {"summary": "", "covered_until_message_id": None, "token_count": 0}
+    return {
+        "id": summary.id,
+        "summary": summary.summary,
+        "covered_until_message_id": summary.covered_until_message_id,
+        "summary_version": summary.summary_version,
+        "token_count": summary.token_count,
+    }
+
+
 @app.post("/api/messages", status_code=201)
 async def create_message(request: MessageRequest, db: AsyncSession = Depends(get_db)):
     if await db.get(Session, request.session_id) is None:
@@ -232,202 +402,46 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
             )
         ).all()
     )
-    db.add(Message(session_id=session.id, role="user", content=request.prompt))
+    user_message = Message(session_id=session.id, role="user", content=request.prompt)
+    db.add(user_message)
     await db.commit()
     await db.refresh(run)
+    await db.refresh(user_message)
 
     async def events():
         try:
-            workspace = (
-                str((WORKSPACE_ROOT / "projects" / str(request.project_id)).resolve())
-                if request.project_id
-                else str(WORKSPACE_ROOT)
+            workspace = str(
+                (WORKSPACE_ROOT / "projects" / str(request.project_id)).resolve()
             )
-            if not request.prompt.startswith((
-                "/write ",
-                "/exec ",
-                "/read ",
-                "/list",
-                "/grep",
-            )):
-                try:
-                    from .agent import _workspace_context
-
-                    context = _workspace_context(Path(workspace))
-                    planned = await create_plan(request.prompt, context)
-                    plan = Plan(
-                        project_id=request.project_id,
-                        session_id=session.id,
-                        run_id=run.id,
-                        goal=planned.goal,
-                        summary=planned.summary,
-                    )
-                    db.add(plan)
-                    await db.flush()
-                    run.plan_id = plan.id
-                    task_ids = {}
-                    for item in planned.tasks:
-                        task = Task(
-                            plan_id=plan.id,
-                            task_key=item["task_key"],
-                            title=item["title"],
-                            description=item["description"],
-                            task_type=item.get("task_type", "inspect"),
-                            input_data=json.dumps(item, ensure_ascii=False),
-                        )
-                        db.add(task)
-                        await db.flush()
-                        task_ids[task.task_key] = task.id
-                    for item in planned.tasks:
-                        for dependency in item.get("depends_on", []):
-                            db.add(
-                                TaskDependency(
-                                    plan_id=plan.id,
-                                    task_id=task_ids[item["task_key"]],
-                                    depends_on_task_id=task_ids[dependency],
-                                )
-                            )
-                    await db.commit()
-                    yield f"data: {json.dumps({'run_id': run.id, 'plan_id': plan.id, 'type': 'plan.created', 'content': planned.summary, 'status': plan.status}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'run_id': run.id, 'plan_id': plan.id, 'type': 'plan.confirmation_required', 'content': planned.goal}, ensure_ascii=False)}\n\n"
-                    return
-                except Exception as error:
-                    run.status = "failed"
-                    await db.commit()
-                    yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.failed', 'content': f'Plan validation failed: {error}'}, ensure_ascii=False)}\n\n"
-                    return
-            if (
-                request.prompt.startswith("/write ")
-                or request.prompt.startswith("/exec ")
-                or request.prompt.startswith("/read ")
-            ):
-                if request.prompt.startswith("/write "):
-                    _, path, content = request.prompt.split(" ", 2)
-                    tool_name, arguments, risk, target = (
-                        "write_file",
-                        {"path": path, "content": content},
-                        get_tool("write_file").risk,
-                        path,
-                    )
-                elif request.prompt.startswith("/read "):
-                    path = request.prompt.removeprefix("/read ").strip()
-                    guard = PathGuard(
-                        (
-                            WORKSPACE_ROOT / "projects" / str(request.project_id)
-                        ).resolve()
-                    )
-                    if not guard.is_sensitive(guard.resolve(path)):
-                        # Non-sensitive reads continue through the normal Agent tool path.
-                        history = [
-                            (message.role, message.content)
-                            for message in previous_messages
-                        ]
-                        async for event in run_agent(
-                            request.prompt, workspace, history, f"session-{session.id}"
-                        ):
-                            db.add(
-                                AgentEventRecord(
-                                    run_id=run.id,
-                                    event_type=event.type,
-                                    content=event.content,
-                                    tool=event.tool,
-                                )
-                            )
-                            await db.commit()
-                            yield f"data: {json.dumps({'run_id': run.id, 'type': event.type, 'content': event.content, 'tool': event.tool}, ensure_ascii=False)}\n\n"
-                        return
-                    tool_name, arguments, risk, target = (
-                        "read_file",
-                        {"path": path},
-                        get_tool("read_file").risk,
-                        path,
-                    )
-                    risk = type(risk)(
-                        "high", "sensitive file access requires explicit approval", True
-                    )
-                else:
-                    command = request.prompt.removeprefix("/exec ").strip()
-                    tool_name, arguments, risk, target = (
-                        "execute_command",
-                        {"command": command},
-                        command_risk(command),
-                        ".",
-                    )
-                approval = Approval(
-                    run_id=run.id,
-                    session_id=session.id,
-                    tool_name=tool_name,
-                    arguments=json.dumps(arguments),
-                    risk_level=risk.level,
-                    risk_reason=risk.reason,
-                    target_path=target,
+            prepared_context = await ContextManager(settings).build_context(
+                db,
+                project_id=request.project_id,
+                session_id=session.id,
+                prompt=request.prompt,
+                history=previous_messages,
+            )
+            if prepared_context.compacted:
+                compact_event = AgentEvent(
+                    "context.compacted",
+                    content=(
+                        "已自动压缩较早的会话历史，保留结构化摘要和最近对话后继续执行。"
+                    ),
                 )
-                db.add(approval)
                 db.add(
-                    AuditLog(
-                        project_id=request.project_id,
-                        session_id=session.id,
+                    AgentEventRecord(
                         run_id=run.id,
-                        event_type="approval.requested",
-                        tool_name=tool_name,
-                        details=scrub(arguments),
+                        event_type=compact_event.type,
+                        content=compact_event.content,
                     )
                 )
                 await db.commit()
-                await db.refresh(approval)
-                yield f"data: {json.dumps({'run_id': run.id, 'type': 'approval.required', 'approval_id': approval.id, 'tool': tool_name, 'content': risk.reason, 'risk_level': risk.level, 'arguments': scrub(arguments), 'target_path': target}, ensure_ascii=False)}\n\n"
-                while True:
-                    await asyncio.sleep(1)
-                    await db.refresh(approval)
-                    if approval.status != "PENDING":
-                        break
-                if approval.status != "APPROVED":
-                    run.status = (
-                        "cancelled" if approval.status == "CANCELLED" else "failed"
-                    )
-                    db.add(
-                        AuditLog(
-                            project_id=request.project_id,
-                            session_id=session.id,
-                            run_id=run.id,
-                            event_type=f"approval.{approval.status.lower()}",
-                            tool_name=tool_name,
-                            details=approval.resolution_reason or "",
-                        )
-                    )
-                    await db.commit()
-                    yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.failed', 'content': f'Approval {approval.status.lower()}'}, ensure_ascii=False)}\n\n"
-                    return
-                guard = PathGuard(Path(workspace))
-                if tool_name == "write_file":
-                    result = get_tool(tool_name).handler(
-                        arguments["path"], arguments["content"], guard
-                    )
-                elif tool_name == "read_file":
-                    get_tool(tool_name).handler(arguments["path"], guard)
-                    result = "已获批准读取敏感配置，具体内容已隐藏，不会显示在聊天或审计日志中。"
-                else:
-                    result = await get_tool(tool_name).handler(
-                        arguments["command"], guard
-                    )
-                run.status = "completed"
-                db.add(
-                    AuditLog(
-                        project_id=request.project_id,
-                        session_id=session.id,
-                        run_id=run.id,
-                        event_type="tool.executed",
-                        tool_name=tool_name,
-                        details=scrub(result),
-                    )
-                )
-                await db.commit()
-                yield f"data: {json.dumps({'run_id': run.id, 'type': 'message.delta', 'content': result, 'tool': tool_name}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.finished', 'content': ''}, ensure_ascii=False)}\n\n"
-                return
-            history = [(message.role, message.content) for message in previous_messages]
+                yield f"data: {json.dumps({'run_id': run.id, 'type': compact_event.type, 'content': compact_event.content}, ensure_ascii=False)}\n\n"
             async for event in run_agent(
-                request.prompt, workspace, history, f"session-{session.id}"
+                request.prompt,
+                workspace,
+                history=None,
+                thread_id=f"session-{session.id}",
+                context_text=prepared_context.render(),
             ):
                 db.add(
                     AgentEventRecord(
@@ -440,7 +454,7 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                 if event.type in {"run.finished", "run.failed"}:
                     run.status = (
                         "completed" if event.type == "run.finished" else "failed"
-                    )
+                )
                 if event.type == "message.delta":
                     db.add(
                         Message(
@@ -451,6 +465,16 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                     )
                 await db.commit()
                 yield f"data: {json.dumps({'run_id': run.id, 'type': event.type, 'content': event.content, 'tool': event.tool}, ensure_ascii=False)}\n\n"
+            if run.status == "completed":
+                await MemoryService(settings).extract_and_persist(
+                    db,
+                    request.prompt,
+                    project_id=request.project_id,
+                    session_id=session.id,
+                    source_message_ids=[user_message.id],
+                    source_run_id=run.id,
+                )
+                await db.commit()
         except Exception as error:
             run.status = "failed"
             failure = AgentEventRecord(

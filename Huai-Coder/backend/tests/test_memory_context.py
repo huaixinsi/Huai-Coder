@@ -1,0 +1,116 @@
+from pathlib import Path
+
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.config import Settings
+from app.context import ContextManager, estimate_tokens
+from app.database import Base
+from app.agent import _bound_react_messages
+from app.memory import MemoryService, extract_candidates
+from app.models import Message, Project, Session
+
+
+@pytest.fixture
+async def db_session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        yield session
+    await engine.dispose()
+
+
+def test_extracts_explicit_memory_and_classifies_it():
+    candidates = extract_candidates(
+        "请记住：项目决定使用 PostgreSQL，用户偏好中文回复。",
+        project_id=12,
+        session_id=3,
+        source_message_ids=[7],
+    )
+    assert len(candidates) == 2
+    assert {candidate.memory_type for candidate in candidates} == {"decision", "preference"}
+    assert all(candidate.importance >= 8 for candidate in candidates)
+
+
+def test_rejects_credentials_from_memory():
+    assert extract_candidates(
+        "请记住：API_KEY=super-secret-value",
+        project_id=12,
+    ) == []
+
+
+def test_react_context_compacts_complete_tool_pairs():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "inspect project"},
+    ]
+    for index in range(8):
+        messages.extend([
+            {"role": "assistant", "content": None, "tool_calls": [{"id": str(index)}]},
+            {"role": "tool", "tool_call_id": str(index), "content": "x" * 500},
+        ])
+    compacted = _bound_react_messages(messages, 300)
+    assert len(compacted) < len(messages)
+    assert compacted[0]["role"] == "system"
+    assert compacted[1]["role"] == "user"
+    assert all(
+        not (index > 1 and message["role"] == "tool" and compacted[index - 1]["role"] != "assistant")
+        for index, message in enumerate(compacted)
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_upsert_deduplicates_and_searches(db_session):
+    settings = Settings(memory_max_retrieved=8)
+    service = MemoryService(settings)
+    first = extract_candidates("请记住：项目使用 PostgreSQL 数据库。", project_id=1)[0]
+    second = extract_candidates("请记住：项目使用 PostgreSQL 数据库作为主库。", project_id=1)[0]
+    await service.upsert(db_session, first)
+    await service.upsert(db_session, second)
+    await db_session.commit()
+    rows = await service.list_project_memories(db_session, 1)
+    assert len(rows) == 1
+    found = await service.search(db_session, project_id=1, query="PostgreSQL 主库")
+    assert len(found) == 1
+    assert found[0].access_count == 1
+
+
+@pytest.mark.asyncio
+async def test_context_compaction_keeps_recent_messages_and_summary(db_session):
+    project = Project(name="context-test")
+    db_session.add(project)
+    await db_session.flush()
+    session = Session(project_id=project.id, title="long session")
+    db_session.add(session)
+    await db_session.flush()
+    messages = []
+    for index in range(10):
+        message = Message(
+            session_id=session.id,
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"第 {index} 轮：项目决定使用 PostgreSQL，并完成文件 file{index}.py。",
+        )
+        db_session.add(message)
+        messages.append(message)
+    await db_session.flush()
+    manager = ContextManager(
+        Settings(
+            context_max_tokens=300,
+            context_compaction_threshold=0.8,
+            context_recent_turns=2,
+        )
+    )
+    prepared = await manager.build_context(
+        db_session,
+        project_id=project.id,
+        session_id=session.id,
+        prompt="下一步继续处理数据库",
+        history=messages,
+    )
+    await db_session.commit()
+    assert prepared.compacted is True
+    assert len(prepared.recent_messages) == 4
+    assert "关键决策" in prepared.summary_context
+    assert estimate_tokens(prepared.render()) < estimate_tokens("\n".join(m.content for m in messages))

@@ -9,7 +9,7 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
+test = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "aiosqlite>=0.20,<1"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]
