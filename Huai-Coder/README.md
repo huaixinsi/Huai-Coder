@@ -1,13 +1,32 @@
 # Huai-Coder
 
-Huai-Coder 是一个支持项目级代码分析、文件修改和计划执行的 Web Agent。
+Huai-Coder 是一个面向真实代码仓库的项目级 Web Agent。它可以读取项目上下文、生成执行计划、调用受控工具完成任务，并在多轮对话中保留长期记忆和会话摘要。
+
+## 核心能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 项目工作区 | 为每个项目隔离文件和会话，支持完整文件夹递归上传，也支持多文件上传。 |
+| Plan-and-Execute | 先生成结构化计划，用户确认后再按依赖执行，支持暂停、继续、取消和基础重试。 |
+| 长期记忆 | 保存可复用的项目事实、技术决策、用户偏好、约束和待办事项，并支持检索、更新、删除和审计。 |
+| 上下文压缩 | 按 Token 预算保留系统规则、当前任务、记忆、会话摘要和最近对话，避免长会话撑爆模型上下文。 |
+| ReAct Agent | 根据模型决策循环执行 `list_dir`、`read_file`、`grep_code`、`write_file`、`execute_command` 等工具。 |
+| 子 Agent | 提供 explorer、planner、coder、tester 四类受限子 Agent，每类 Agent 只有明确的工具白名单。 |
+| 安全审批 | 写文件、执行命令和敏感配置访问等高风险操作需要人工确认，并保留审计事件。 |
+| 可追踪执行过程 | 前端聚合显示每次工具调用，展开后可以查看参数、结果和上下文压缩记录。 |
 
 ## Docker 启动
 
-在当前目录准备 `.env`：
+在仓库根目录执行：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+编辑 `.env`，至少配置数据库密码和一个兼容 OpenAI Chat Completions API 的模型服务：
 
 ```env
-POSTGRES_PASSWORD=your-password
+POSTGRES_PASSWORD=your-local-password
 LLM_BASE_URL=https://api.deepseek.com
 LLM_API_KEY=your-api-key
 LLM_MODEL=deepseek-chat
@@ -21,83 +40,127 @@ docker compose up -d --build
 
 服务地址：
 
-- 前端：http://localhost
+- Web 首页：http://localhost
 - API：http://localhost:8000
 - 健康检查：http://localhost:8000/health
 
+停止服务：
+
+```powershell
+docker compose down
+```
+
 ## 使用流程
 
-1. 创建或选择项目。
-2. 创建或选择会话。
-3. 使用“选择完整文件夹”上传项目，也可以单独选择多个文件。
-4. 输入问题，Agent 会先生成执行计划。
-5. 查看计划后点击“确认计划”。
-6. 涉及写文件、执行命令或敏感配置时，在审批弹窗中批准、拒绝或取消。
+1. 打开 Web 首页并创建或选择一个项目。
+2. 创建或选择会话，上传完整项目目录或指定文件。
+3. 输入任务。Agent 会先分析项目并生成执行计划。
+4. 检查计划和任务依赖，点击“确认计划”。
+5. 遇到写文件、执行命令等高风险操作时，在审批弹窗中批准、拒绝或取消。
+6. 在“执行过程”面板中展开任意工具调用，查看具体参数和返回结果。
+7. 在项目面板中维护长期记忆，或点击“压缩会话”生成可追溯的会话摘要。
 
-## 已实现功能
+## 记忆与上下文压缩
 
-### 项目与会话
+长期记忆和会话摘要是两类不同的数据：
 
-- 一个项目支持多个会话。
-- 支持会话切换、创建和删除。
-- 会话消息持久化到 PostgreSQL。
+- 长期记忆保存跨会话仍然有价值的信息，例如项目技术栈、架构决策和编码约束。
+- 会话摘要只覆盖当前会话的历史消息，用于减少下一次请求的上下文长度。
+- 原始消息和工具事件仍然持久化，摘要只是构建 Prompt 时使用的派生数据。
+- 密码、Token、API Key、Cookie、私钥和敏感环境变量不会保存为长期记忆。
 
-### 文件与 Agent
+默认配置可以在 `.env` 或 `backend/.env` 中调整：
 
-- 支持完整文件夹递归上传。
-- 支持单文件和多文件上传。
-- 保留目录结构和相对路径。
-- 自动生成项目文件清单和代码上下文。
-- 支持 `list_dir`、`read_file` 和 `grep_code`。
+```env
+MEMORY_ENABLED=true
+MEMORY_EXTRACTION_ENABLED=true
+MEMORY_MAX_RETRIEVED=8
+MEMORY_RETENTION_DAYS=90
+CONTEXT_COMPACTION_ENABLED=true
+CONTEXT_MAX_TOKENS=32768
+CONTEXT_COMPACTION_THRESHOLD=0.8
+CONTEXT_RECENT_TURNS=8
+```
 
-### 安全与审批
+当前版本使用保守的 Token 估算和关键词相关性排序，不要求额外部署 Redis 或向量数据库；后续可以接入 Embedding 和 pgvector 做混合检索。
 
-- 只能访问当前项目工作区。
-- 拒绝路径穿越、绝对路径和工作区外访问。
-- `.env`、API Key、Token、密码、SSH 配置和证书等敏感内容默认不回显。
-- `write_file` 和 `execute_command` 等高风险操作需要人工确认。
-- 审批结果和工具执行结果写入审计日志。
+## 安全模型
 
-### Plan-and-Execute
-
-- Planner 输出结构化 JSON 计划。
-- Plan Validator 检查任务字段、依赖和循环依赖。
-- 计划确认后才会执行任务。
-- 支持任务状态、依赖关系、串行调度和基础重试。
-- 支持计划暂停、继续和取消。
+- 所有文件访问都限制在当前项目工作区内。
+- 拒绝路径穿越、绝对路径和工作区外路径。
+- 敏感文件和凭证内容默认不回显。
+- 子 Agent 通过工具白名单和运行时校验进行双重限制。
+- 高风险工具需要人工审批。
+- Agent Run、工具事件、审批和记忆变更都保留审计记录。
 
 ## 主要 API
 
 ```text
-GET  /api/projects
-POST /api/projects
-GET  /api/projects/{project_id}/sessions
-POST /api/sessions
-POST /api/runs
-GET  /api/plans/{plan_id}
-GET  /api/plans/{plan_id}/tasks
-POST /api/plans/{plan_id}/confirm
-POST /api/plans/{plan_id}/pause
-POST /api/plans/{plan_id}/resume
-POST /api/plans/{plan_id}/cancel
-GET  /api/runs/{run_id}/approvals
-POST /api/approvals/{approval_id}/approve
-POST /api/approvals/{approval_id}/reject
+GET    /api/projects
+POST   /api/projects
+GET    /api/projects/{project_id}/sessions
+POST   /api/sessions
+POST   /api/runs
+
+GET    /api/projects/{project_id}/memories
+POST   /api/memories
+PATCH  /api/memories/{memory_id}
+DELETE /api/memories/{memory_id}
+POST   /api/sessions/{session_id}/compact
+
+GET    /api/plans/{plan_id}
+GET    /api/plans/{plan_id}/tasks
+POST   /api/plans/{plan_id}/confirm
+POST   /api/plans/{plan_id}/pause
+POST   /api/plans/{plan_id}/resume
+POST   /api/plans/{plan_id}/cancel
 ```
 
-## 验证
+## 项目结构
+
+```text
+Huai-Coder/
+├─ backend/
+│  ├─ app/agent.py              # 主 Agent 与 ReAct 循环
+│  ├─ app/agents/               # 子 Agent 配置、权限和执行器
+│  ├─ app/memory.py             # 长期记忆提取、检索和生命周期
+│  ├─ app/context.py            # 上下文预算、摘要和压缩
+│  ├─ app/registry.py           # 工具注册、风险与审批
+│  ├─ migrations/               # 数据库迁移
+│  └─ tests/                    # 后端测试
+├─ frontend/
+│  └─ src/main.tsx              # Web 首页和对话界面
+├─ docs/                        # 架构与设计文档
+├─ docker-compose.yml
+└─ README.md
+```
+
+## 本地验证
+
+前端构建：
 
 ```powershell
 cd frontend
 npm.cmd run build
-
-docker compose up -d --build
-curl http://localhost:8000/health
 ```
+
+后端测试和 Docker 验证：
+
+```powershell
+docker compose up -d --build backend frontend
+docker compose exec -T backend python -m compileall -q /app/app /app/migrations
+docker compose exec -T backend pytest -q /workspace/backend/tests
+Invoke-RestMethod http://localhost:8000/health
+```
+
+## 相关文档
+
+- [长期记忆与上下文压缩设计](docs/memory-and-context-design.md)
+- [Sub-Agent 架构重构说明](docs/sub-agent-architecture.md)
 
 ## 开发约定
 
 - 每个阶段使用独立分支开发。
 - 修改后运行前端构建、后端测试和 Docker 验证。
 - 阶段完成后提交 Pull Request。
-- 不提交真实密钥、密码、Token 或私钥。
+- 不提交真实密钥、密码、Token、Cookie 或私钥。
