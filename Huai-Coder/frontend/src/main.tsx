@@ -23,7 +23,7 @@ type Activity = { type: string; tool?: string; arguments?: string; content?: str
 type ChatMessage = { id: string; role: "user" | "assistant" | "system"; content: string; activities: Activity[]; status?: "running" | "done" | "failed" };
 type Approval = StreamEvent;
 type DirectoryFile = { file: File; relativePath: string };
-type WorkspaceStatus = { bound: boolean; file_count: number };
+type WorkspaceStatus = { bound: boolean; file_count: number; folder_name?: string | null };
 type RunStatus = "idle" | "running" | "waiting" | "completed" | "failed" | "stopped";
 
 declare global {
@@ -99,7 +99,11 @@ function App() {
     if (workspaceResponse.ok) {
       const workspace = await workspaceResponse.json() as WorkspaceStatus;
       setFolderBound(workspace.bound);
-      if (workspace.bound && !folderByProject[id]) setFolderName(`项目工作区（${workspace.file_count} 个文件）`);
+      if (workspace.bound) {
+        const savedFolderName = workspace.folder_name || folderByProject[id] || `项目工作区（${workspace.file_count} 个文件）`;
+        setFolderName(savedFolderName);
+        if (workspace.folder_name) setFolderByProject(current => ({ ...current, [id]: workspace.folder_name! }));
+      }
     }
     const r = await fetch(`${API}/api/projects/${id}/sessions`);
     const list: ChatSession[] = r.ok ? await r.json() : [];
@@ -286,10 +290,11 @@ function App() {
         const data = new FormData();
         items.slice(i, i + 20).forEach(item => { data.append("files", item.file, item.file.name); data.append("relative_paths", item.relativePath); });
         data.append("replace", replace && i === 0 ? "true" : "false");
+        if (replace && i === 0) data.append("folder_name", label);
         const r = await fetch(`${API}/api/projects/${selectedProject}/files`, { method: "POST", body: data });
         if (!r.ok) throw new Error(`上传失败 (${r.status})`);
       }
-      const displayName = `${label}（${items.length} 个文件）`;
+      const displayName = label;
       setFolderName(displayName); setFolderBound(true);
       setFolderByProject(current => ({ ...current, [selectedProject]: displayName }));
     } catch (error) {

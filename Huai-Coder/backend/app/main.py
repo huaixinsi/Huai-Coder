@@ -68,6 +68,11 @@ async def lifespan(_: FastAPI):
         )
         await connection.execute(
             text(
+                "ALTER TABLE projects ADD COLUMN IF NOT EXISTS workspace_name VARCHAR(255)"
+            )
+        )
+        await connection.execute(
+            text(
                 "ALTER TABLE approvals ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES plans(id) ON DELETE CASCADE"
             )
         )
@@ -171,9 +176,11 @@ async def upload_project_files(
     files: list[UploadFile] = File(...),
     relative_paths: list[str] = Form(default=[]),
     replace: bool = Form(default=False),
+    folder_name: str | None = Form(default=None),
     db: AsyncSession = Depends(get_db),
 ):
-    if await db.get(Project, project_id) is None:
+    project = await db.get(Project, project_id)
+    if project is None:
         raise HTTPException(404, "Project not found")
     root = (WORKSPACE_ROOT / "projects" / str(project_id)).resolve()
     if replace and root.exists() and WORKSPACE_ROOT in root.parents:
@@ -190,12 +197,16 @@ async def upload_project_files(
             raise HTTPException(400, "Invalid file path")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(await upload.read())
-    return {"project_id": project_id, "files": len(files)}
+    if replace and folder_name and folder_name.strip():
+        project.workspace_name = folder_name.strip()[:255]
+        await db.commit()
+    return {"project_id": project_id, "files": len(files), "folder_name": project.workspace_name}
 
 
 @app.get("/api/projects/{project_id}/workspace")
 async def get_project_workspace(project_id: int, db: AsyncSession = Depends(get_db)):
-    if await db.get(Project, project_id) is None:
+    project = await db.get(Project, project_id)
+    if project is None:
         raise HTTPException(404, "Project not found")
     root = (WORKSPACE_ROOT / "projects" / str(project_id)).resolve()
     file_count = sum(1 for item in root.rglob("*") if item.is_file()) if root.exists() else 0
@@ -203,6 +214,7 @@ async def get_project_workspace(project_id: int, db: AsyncSession = Depends(get_
         "project_id": project_id,
         "bound": file_count > 0,
         "file_count": file_count,
+        "folder_name": project.workspace_name,
     }
 
 
