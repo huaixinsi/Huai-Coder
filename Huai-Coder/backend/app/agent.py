@@ -261,13 +261,20 @@ def _workspace_context(root: Path) -> str:
     )
 
 
-def _build_system_prompt(context: str, tool_approval_enabled: bool = True) -> str:
+def _build_system_prompt(
+    context: str, tool_approval_enabled: bool = True, local_workspace: bool = False
+) -> str:
     """Build the main agent system prompt with tool descriptions and sub-agent list."""
     agents_desc = json.dumps(list_subagents(), ensure_ascii=False, indent=2)
     approval_note = (
         "Project tool approvals are temporarily disabled. Execute tools directly within the workspace."
         if not tool_approval_enabled
         else "High-risk tools require explicit user approval before execution."
+    )
+    workspace_note = (
+        "Write operations are local-file proposals: emit write_file calls and verify them with read_file; execute_command and task are unavailable in local mode."
+        if local_workspace
+        else "Tools operate in the selected project workspace."
     )
     return (
         "You are a coding assistant working inside a project workspace. "
@@ -289,6 +296,7 @@ def _build_system_prompt(context: str, tool_approval_enabled: bool = True) -> st
         "5. Keep all file paths inside the selected project workspace.\n"
         "6. When the user asks to create or modify code, use write_file and verify the result with read_file or a test command.\n"
         "7. When done, provide a clear final answer without tool calls.\n\n"
+        f"## Workspace Mode\n{workspace_note}\n\n"
         f"## Project Context\n{context}"
     )
 
@@ -379,6 +387,7 @@ class AgentState(TypedDict):
     workspace: str
     response: str
     events: list["AgentEvent"]
+    local_workspace: bool
 
 
 @dataclass
@@ -398,6 +407,7 @@ async def _execute(state: AgentState) -> AgentState:
     workspace = state.get("workspace", ".")
     events: list[AgentEvent] = [AgentEvent("run.started")]
     settings = get_settings()
+    local_workspace = bool(state.get("local_workspace", False))
 
     # Sensitive request guard
     if settings.tool_approval_enabled and any(marker in user_prompt.lower() for marker in SENSITIVE_REQUEST_MARKERS):
@@ -408,7 +418,9 @@ async def _execute(state: AgentState) -> AgentState:
 
     guard = PathGuard(Path(workspace))
     context = _workspace_context(Path(workspace))
-    system_prompt = _build_system_prompt(context, settings.tool_approval_enabled)
+    system_prompt = _build_system_prompt(
+        context, settings.tool_approval_enabled, local_workspace
+    )
     tool_schemas = _build_tool_schemas()
 
     messages: list[dict] = [
@@ -418,6 +430,7 @@ async def _execute(state: AgentState) -> AgentState:
 
     final_answer = ""
     repeat_records: dict[str, _RepeatRecord] = {}
+    pending_local_writes: dict[str, str] = {}
     while True:
         messages = _bound_react_messages(messages, settings.context_max_tokens)
         response = await complete_with_tools(messages, tool_schemas, timeout=120)
@@ -486,7 +499,11 @@ async def _execute(state: AgentState) -> AgentState:
             handler = tool_spec.handler
 
             # Approval gate for high-risk tools
-            if settings.tool_approval_enabled and tool_spec.risk.requires_approval:
+            if (
+                settings.tool_approval_enabled
+                and not local_workspace
+                and tool_spec.risk.requires_approval
+            ):
                 events.append(
                     AgentEvent(
                         "approval.required",
@@ -503,7 +520,36 @@ async def _execute(state: AgentState) -> AgentState:
                 events.append(AgentEvent("message.delta", final_answer))
                 break
 
-            if asyncio.iscoroutinefunction(handler):
+            if local_workspace and tc.name == "write_file":
+                target = guard.resolve(tc.arguments["path"])
+                relative = str(target.relative_to(guard.root)).replace("\\", "/")
+                content = str(tc.arguments["content"])
+                pending_local_writes[relative] = content
+                events.append(
+                    AgentEvent(
+                        "file.write",
+                        json.dumps(
+                            {"path": relative, "content": content}, ensure_ascii=False
+                        ),
+                        tc.name,
+                    )
+                )
+                result = f"LOCAL_FILE_WRITE_PENDING: {relative} ({len(content)} bytes)"
+            elif local_workspace and tc.name in {"execute_command", "task"}:
+                result = (
+                    "LOCAL_WORKSPACE_ONLY: this operation is disabled because the bound folder is local. "
+                    "Use write_file for code changes and read_file to verify them."
+                )
+            elif local_workspace and tc.name == "read_file":
+                target = guard.resolve(tc.arguments["path"])
+                relative = str(target.relative_to(guard.root)).replace("\\", "/")
+                if relative in pending_local_writes:
+                    result = pending_local_writes[relative]
+                elif asyncio.iscoroutinefunction(handler):
+                    result = await handler(guard=guard, **tc.arguments)
+                else:
+                    result = handler(guard=guard, **tc.arguments)
+            elif asyncio.iscoroutinefunction(handler):
                 result = await handler(guard=guard, **tc.arguments)
             else:
                 result = handler(guard=guard, **tc.arguments)
@@ -564,6 +610,7 @@ async def run_agent(
     history: list[tuple[str, str]] | None = None,
     thread_id: str = "default",
     context_text: str | None = None,
+    local_workspace: bool = True,
 ) -> AsyncIterator[AgentEvent]:
     settings = get_settings()
     connection_string = settings.database_url.replace("+asyncpg", "")
@@ -585,6 +632,7 @@ async def run_agent(
                 "response": "",
                 "events": [],
                 "workspace": workspace,
+                "local_workspace": local_workspace,
             },
             config={"configurable": {"thread_id": thread_id}},
         )

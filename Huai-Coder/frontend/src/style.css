@@ -295,6 +295,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .folder-area { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
 .folder-name, .muted { color: #7180a1; font-size: 11px; }
 .folder-reminder { color: #ffd29a; font-size: 11px; }
+.folder-sync { color: #91e8d4; font-size: 11px; }
 .folder-error { flex-basis: 100%; color: #ff9fb5; font-size: 10px; }
 .memory-panel { margin-top: 18px; padding-top: 17px; border-top: 1px solid var(--line); }
 .memory-create { margin-top: 12px; }
