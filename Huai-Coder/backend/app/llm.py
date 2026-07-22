@@ -1,14 +1,105 @@
+import json
+from dataclasses import dataclass
+from typing import Any
+
 import httpx
 from .config import get_settings
 
-async def complete(prompt: str) -> str:
+SYSTEM_PROMPT = (
+    "你是项目代码分析助手。只根据提供的项目上下文回答，不要输出 XML、DSML、tool_calls 或伪造的工具调用；"
+    "如果上下文中没有足够信息，明确说明缺失内容。不要输出任何密钥、密码、Token 或凭证值。"
+)
+
+
+@dataclass
+class ParsedToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+    raw: dict[str, Any]  # original tool_call dict for message history
+
+
+@dataclass
+class LLMResponse:
+    content: str
+    tool_call: ParsedToolCall | None = None
+
+
+async def complete(prompt: str | list[dict], timeout: int = 60) -> str:
+    """Backward-compatible completion. Accepts a string prompt or a messages list."""
     settings = get_settings()
     if not (settings.llm_base_url and settings.llm_api_key and settings.llm_model):
-        return f"Received: {prompt}\n\nTry /list ., /read README.md, or /grep FastAPI backend"
+        text = prompt if isinstance(prompt, str) else str(prompt[-1].get("content", ""))
+        return f"Received: {text}\n\nTry /list ., /read README.md, or /grep FastAPI backend"
+
+    if isinstance(prompt, str):
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+    else:
+        messages = prompt
+
     endpoint = settings.llm_base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
-    payload = {"model": settings.llm_model, "messages": [{"role": "system", "content": "你是项目代码分析助手。只根据提供的项目上下文回答，不要输出 XML、DSML、tool_calls 或伪造的工具调用；如果上下文中没有足够信息，明确说明缺失内容。不要输出任何密钥、密码、Token 或凭证值。"}, {"role": "user", "content": prompt}], "stream": False}
-    async with httpx.AsyncClient(timeout=60) as client:
+    payload = {"model": settings.llm_model, "messages": messages, "stream": False}
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(endpoint, headers=headers, json=payload)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
+
+
+async def complete_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    timeout: int = 60,
+) -> LLMResponse:
+    """Completion with OpenAI-compatible function calling support.
+
+    Returns LLMResponse with either .content (final answer) or .tool_call (action to take).
+    """
+    settings = get_settings()
+    if not (settings.llm_base_url and settings.llm_api_key and settings.llm_model):
+        return LLMResponse(content="LLM not configured. Cannot execute tool calls.")
+
+    endpoint = settings.llm_base_url.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
+    payload: dict[str, Any] = {
+        "model": settings.llm_model,
+        "messages": messages,
+        "stream": False,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(endpoint, headers=headers, json=payload)
+        response.raise_for_status()
+        choice = response.json()["choices"][0]["message"]
+
+    # Parse tool_calls if present
+    tool_calls = choice.get("tool_calls")
+    if tool_calls:
+        tc = tool_calls[0]
+        fn = tc["function"]
+        try:
+            arguments = (
+                json.loads(fn["arguments"])
+                if isinstance(fn["arguments"], str)
+                else fn["arguments"]
+            )
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        return LLMResponse(
+            content=choice.get("content") or "",
+            tool_call=ParsedToolCall(
+                id=tc.get("id", "call_0"),
+                name=fn["name"],
+                arguments=arguments,
+                raw=tc,
+            ),
+        )
+
+    return LLMResponse(content=choice.get("content") or "")

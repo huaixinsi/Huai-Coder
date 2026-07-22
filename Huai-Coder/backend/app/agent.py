@@ -1,10 +1,15 @@
 from pathlib import Path
 from typing import AsyncIterator, TypedDict
 from dataclasses import dataclass
+import json
+
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from .config import get_settings
-from .registry import get_tool
+from .registry import get_tool, TOOLS
+from .llm import complete_with_tools
+from .agents.registry import list_subagents
+from .context import estimate_messages
 
 SENSITIVE_REQUEST_MARKERS = (
     ".env",
@@ -17,16 +22,6 @@ SENSITIVE_REQUEST_MARKERS = (
     "凭证",
     "access key",
 )
-from .llm import complete
-
-
-class AgentState(TypedDict):
-    prompt: str
-    user_prompt: str
-    workspace: str
-    response: str
-    events: list["AgentEvent"]
-
 
 _SKIP_DIRS = {
     ".git",
@@ -103,6 +98,29 @@ _CODE_EXTENSIONS = {
     ".bat",
 }
 
+MAX_REACT_TURNS = 15
+
+
+def _bound_react_messages(messages: list[dict], max_tokens: int) -> list[dict]:
+    """Keep the tool loop inside the model budget without breaking tool pairs."""
+    if estimate_messages(messages) <= int(max_tokens * 0.8):
+        return messages
+    if len(messages) <= 4:
+        return messages
+    prefix = messages[:2]
+    tail = messages[2:]
+    # Tool observations are appended as assistant(tool_calls) + tool pairs.
+    keep = tail[-8:]
+    while keep and keep[0].get("role") == "tool":
+        keep = keep[1:]
+    compacted = prefix + [
+        {
+            "role": "system",
+            "content": "Earlier tool observations were compacted. Use the recent observations and re-check files when necessary.",
+        }
+    ] + keep
+    return compacted
+
 
 def _workspace_context(root: Path) -> str:
     """Give the model a bounded, useful snapshot of the selected project."""
@@ -143,6 +161,119 @@ def _workspace_context(root: Path) -> str:
     )
 
 
+def _build_system_prompt(context: str) -> str:
+    """Build the main agent system prompt with tool descriptions and sub-agent list."""
+    agents_desc = json.dumps(list_subagents(), ensure_ascii=False, indent=2)
+    return (
+        "You are a coding assistant working inside a project workspace. "
+        "You have tools to inspect and modify the project. Use them when needed.\n\n"
+        "## Available Tools\n"
+        "- list_dir(path): List files in a directory\n"
+        "- read_file(path): Read a file's content\n"
+        "- grep_code(query, path): Search for text in source files\n"
+        "- write_file(path, content): Write content to a file (requires approval)\n"
+        "- execute_command(command): Run a shell command (requires approval)\n"
+        "- task(agent_name, task): Delegate to a sub-agent\n\n"
+        "## Sub-Agents\n"
+        f"{agents_desc}\n\n"
+        "## Rules\n"
+        "1. Use read-only tools first to understand the project before making changes.\n"
+        "2. For complex tasks, delegate to sub-agents via the 'task' tool.\n"
+        "3. Never output secrets, passwords, tokens, or credentials.\n"
+        "4. If the user asks about sensitive config (.env etc), explain that explicit approval is needed.\n"
+        "5. When done, provide a clear final answer without tool calls.\n\n"
+        f"## Project Context\n{context}"
+    )
+
+
+def _build_tool_schemas() -> list[dict]:
+    """OpenAI-compatible tool schemas for all main agent tools."""
+    schemas = []
+    PARAMS = {
+        "list_dir": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path relative to workspace root",
+                }
+            },
+            "required": ["path"],
+        },
+        "read_file": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to workspace root",
+                }
+            },
+            "required": ["path"],
+        },
+        "grep_code": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search in (default '.')",
+                },
+            },
+            "required": ["query"],
+        },
+        "write_file": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to workspace root",
+                },
+                "content": {"type": "string", "description": "File content to write"},
+            },
+            "required": ["path", "content"],
+        },
+        "execute_command": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to execute"}
+            },
+            "required": ["command"],
+        },
+        "task": {
+            "type": "object",
+            "properties": {
+                "agent_name": {
+                    "type": "string",
+                    "description": "Sub-agent name: explorer, planner, coder, or tester",
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Task description for the sub-agent",
+                },
+            },
+            "required": ["agent_name", "task"],
+        },
+    }
+    for name, spec in TOOLS.items():
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": PARAMS.get(name, {"type": "object", "properties": {}}),
+            },
+        })
+    return schemas
+
+
+class AgentState(TypedDict):
+    prompt: str
+    user_prompt: str
+    workspace: str
+    response: str
+    events: list["AgentEvent"]
+
+
 @dataclass
 class AgentEvent:
     type: str
@@ -151,42 +282,115 @@ class AgentEvent:
 
 
 async def _execute(state: AgentState) -> AgentState:
+    """ReAct loop: LLM thinks -> calls tool -> observes -> repeats until done."""
+    import asyncio
+    from .security import PathGuard
+
     user_prompt = state["user_prompt"]
-    prompt = state["prompt"]
-    events = [AgentEvent("run.started")]
+    agent_prompt = state.get("prompt") or user_prompt
+    workspace = state.get("workspace", ".")
+    events: list[AgentEvent] = [AgentEvent("run.started")]
+
+    # Sensitive request guard
     if any(marker in user_prompt.lower() for marker in SENSITIVE_REQUEST_MARKERS):
-        result = "敏感配置不会被自动读取或回显。若需要访问，请使用 /read .env，系统会先请求你的明确批准。"
-        events.append(AgentEvent("message.delta", result))
-    elif user_prompt.startswith("/list"):
-        path = user_prompt.removeprefix("/list").strip() or "."
-        events.append(AgentEvent("tool.started", tool="list_dir"))
-        result = get_tool("list_dir").handler(path, Path(state.get("workspace", ".")))
-        events.extend([
-            AgentEvent("tool.finished", result, "list_dir"),
-            AgentEvent("message.delta", result),
-        ])
-    elif user_prompt.startswith("/read"):
-        path = user_prompt.removeprefix("/read").strip()
-        events.append(AgentEvent("tool.started", tool="read_file"))
-        result = get_tool("read_file").handler(path, Path(state.get("workspace", ".")))
-        events.extend([
-            AgentEvent("tool.finished", result, "read_file"),
-            AgentEvent("message.delta", result),
-        ])
-    elif user_prompt.startswith("/grep"):
-        query, _, path = user_prompt.removeprefix("/grep").strip().partition(" ")
-        events.append(AgentEvent("tool.started", tool="grep_code"))
-        result = get_tool("grep_code").handler(
-            query, path or ".", Path(state.get("workspace", "."))
+        msg = "敏感配置不会被自动读取或回显。若需要访问，请使用 read_file 工具读取 .env，系统会先请求你的明确批准。"
+        events.append(AgentEvent("message.delta", msg))
+        events.append(AgentEvent("run.finished"))
+        return {**state, "response": msg, "events": events}
+
+    guard = PathGuard(Path(workspace))
+    context = _workspace_context(Path(workspace))
+    system_prompt = _build_system_prompt(context)
+    tool_schemas = _build_tool_schemas()
+
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": agent_prompt},
+    ]
+
+    final_answer = ""
+    repeated_call: tuple[str, str] | None = None
+    repeated_count = 0
+    for turn in range(MAX_REACT_TURNS):
+        messages = _bound_react_messages(messages, get_settings().context_max_tokens)
+        response = await complete_with_tools(messages, tool_schemas, timeout=120)
+
+        # No tool call -> final answer
+        if response.tool_call is None:
+            final_answer = response.content
+            events.append(AgentEvent("message.delta", final_answer))
+            break
+
+        tc = response.tool_call
+        call_signature = (tc.name, json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False))
+        if call_signature == repeated_call:
+            repeated_count += 1
+        else:
+            repeated_call = call_signature
+            repeated_count = 1
+        if repeated_count >= 3:
+            final_answer = (
+                "本轮连续进行了相同的工具调用，Agent 已主动停止，避免重复执行。\n\n"
+                "你可以缩小任务范围，或直接告诉我下一步要检查的文件。"
+            )
+            events.append(AgentEvent("message.delta", final_answer))
+            break
+        events.append(
+            AgentEvent(
+                "tool.started",
+                content=json.dumps({"arguments": tc.arguments}, ensure_ascii=False),
+                tool=tc.name,
+            )
         )
-        events.extend([
-            AgentEvent("tool.finished", result, "grep_code"),
-            AgentEvent("message.delta", result),
-        ])
+
+        # Execute the tool
+        try:
+            tool_spec = get_tool(tc.name, caller="main")
+            handler = tool_spec.handler
+
+            # Approval gate for high-risk tools
+            if tool_spec.risk.requires_approval:
+                events.append(
+                    AgentEvent(
+                        "approval.required",
+                        content=json.dumps({
+                            "tool": tc.name,
+                            "arguments": tc.arguments,
+                            "reason": tool_spec.risk.reason,
+                        }),
+                        tool=tc.name,
+                    )
+                )
+                # In first version: report and stop (terminate-resume pattern)
+                final_answer = f"需要审批: 工具 '{tc.name}' 需要你的确认。原因: {tool_spec.risk.reason}\n参数: {json.dumps(tc.arguments, ensure_ascii=False)}"
+                events.append(AgentEvent("message.delta", final_answer))
+                break
+
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(guard=guard, **tc.arguments)
+            else:
+                result = handler(guard=guard, **tc.arguments)
+        except Exception as exc:
+            result = f"Error: {exc}"
+
+        events.append(AgentEvent("tool.finished", str(result)[:4000], tc.name))
+
+        # Feed observation back to LLM
+        messages.append({"role": "assistant", "content": None, "tool_calls": [tc.raw]})
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": str(result)[:8000],
+        })
     else:
-        events.append(AgentEvent("message.delta", await complete(prompt)))
+        final_answer = (
+            f"本轮已完成 {MAX_REACT_TURNS} 次工具调用，但任务尚未完成。\n\n"
+            "已保留当前会话上下文；你可以继续发送下一步要求，或将任务拆分成更小的步骤。"
+        )
+        events.append(AgentEvent("message.delta", final_answer))
+
     events.append(AgentEvent("run.finished"))
-    return {**state, "response": events[-2].content, "events": events}
+    return {**state, "response": final_answer, "events": events}
 
 
 _builder = StateGraph(AgentState)
@@ -200,17 +404,21 @@ async def run_agent(
     workspace: str = ".",
     history: list[tuple[str, str]] | None = None,
     thread_id: str = "default",
+    context_text: str | None = None,
 ) -> AsyncIterator[AgentEvent]:
     settings = get_settings()
     connection_string = settings.database_url.replace("+asyncpg", "")
     async with AsyncPostgresSaver.from_conn_string(connection_string) as checkpointer:
         await checkpointer.setup()
         graph = _builder.compile(checkpointer=checkpointer)
-        context = _workspace_context(Path(workspace))
-        previous = "\n".join(
-            f"{role}: {content}" for role, content in (history or [])[-20:]
-        )
-        enriched_prompt = f"You are working in the selected project. Use the project context below to answer. If exact details are needed, inspect files with the available workspace tools.\n\nConversation history:\n{previous or '(none)'}\n\n{context}\n\nUser request:\n{prompt}"
+        previous = "\n".join(f"{role}: {content}" for role, content in (history or [])[-20:])
+        enriched_prompt = prompt
+        if context_text:
+            enriched_prompt = f"{context_text}\n\nUser request:\n{prompt}"
+        elif previous:
+            enriched_prompt = (
+                f"Conversation history:\n{previous}\n\nUser request:\n{prompt}"
+            )
         result = await graph.ainvoke(
             {
                 "prompt": enriched_prompt,
