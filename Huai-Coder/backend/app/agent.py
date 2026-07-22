@@ -2,13 +2,15 @@ from pathlib import Path
 from typing import AsyncIterator, TypedDict
 from dataclasses import dataclass
 from hashlib import sha256
+import asyncio
 import json
+from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from .config import get_settings
 from .registry import get_tool, TOOLS
-from .llm import complete_with_tools
+from .llm import ParsedToolCall, complete_with_tools
 from .agents.registry import list_subagents
 from .context import estimate_messages
 
@@ -99,25 +101,44 @@ _CODE_EXTENSIONS = {
     ".bat",
 }
 
-def _bound_react_messages(messages: list[dict], max_tokens: int) -> list[dict]:
-    """Keep the tool loop inside the model budget without breaking tool pairs."""
-    if estimate_messages(messages) <= int(max_tokens * 0.8):
-        return messages
-    if len(messages) <= 4:
-        return messages
+def _bound_react_messages(
+    messages: list[dict], max_tokens: int, threshold: float = 0.75
+) -> tuple[list[dict], bool]:
+    """Compact complete assistant/tool groups without breaking the API contract."""
+    if estimate_messages(messages) <= int(max_tokens * threshold) or len(messages) <= 4:
+        return messages, False
+
     prefix = messages[:2]
-    tail = messages[2:]
-    # Tool observations are appended as assistant(tool_calls) + tool pairs.
-    keep = tail[-8:]
-    while keep and keep[0].get("role") == "tool":
-        keep = keep[1:]
-    compacted = prefix + [
-        {
-            "role": "system",
-            "content": "Earlier tool observations were compacted. Use the recent observations and re-check files when necessary.",
-        }
-    ] + keep
-    return compacted
+    groups: list[list[dict]] = []
+    index = 2
+    while index < len(messages):
+        message = messages[index]
+        group = [message]
+        index += 1
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            while index < len(messages) and messages[index].get("role") == "tool":
+                group.append(messages[index])
+                index += 1
+        groups.append(group)
+
+    keep_groups: list[list[dict]] = []
+    estimated = estimate_messages(prefix)
+    for group in reversed(groups):
+        group_tokens = estimate_messages(group)
+        if keep_groups and estimated + group_tokens > int(max_tokens * threshold):
+            break
+        keep_groups.insert(0, group)
+        estimated += group_tokens
+
+    dropped = groups[: len(groups) - len(keep_groups)]
+    summary = {
+        "role": "system",
+        "content": (
+            f"Earlier context was compacted: {len(dropped)} complete message groups were removed. "
+            "Preserve the original goal and acceptance criteria; re-check files when necessary."
+        ),
+    }
+    return prefix + [summary] + [message for group in keep_groups for message in group], True
 
 
 @dataclass
@@ -272,7 +293,7 @@ def _build_system_prompt(
         else "High-risk tools require explicit user approval before execution."
     )
     workspace_note = (
-        "Write operations are local-file proposals: emit write_file calls and verify them with read_file; execute_command and task are unavailable in local mode."
+        "Write operations are local-file proposals: emit write_file calls and verify them with read_file; execute_command is delegated to the user's Local Runner, which can install detected dependencies and run tests/builds; task is unavailable in local mode."
         if local_workspace
         else "Tools operate in the selected project workspace."
     )
@@ -350,7 +371,9 @@ def _build_tool_schemas() -> list[dict]:
         "execute_command": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Shell command to execute"}
+                "command": {"type": "string", "description": "Command to run in the local project workspace"},
+                "auto_prepare": {"type": "boolean", "description": "Install detected project dependencies before running", "default": True},
+                "timeout_seconds": {"type": "integer", "description": "Maximum command time in seconds", "minimum": 5, "maximum": 900, "default": 120},
             },
             "required": ["command"],
         },
@@ -388,6 +411,7 @@ class AgentState(TypedDict):
     response: str
     events: list["AgentEvent"]
     local_workspace: bool
+    run_id: int | None
 
 
 @dataclass
@@ -397,7 +421,303 @@ class AgentEvent:
     tool: str | None = None
 
 
+CLIENT_TOOL_NAMES = {"list_dir", "read_file", "grep_code", "write_file", "execute_command"}
+_CLIENT_TOOL_WAITERS: dict[str, tuple[int | None, asyncio.Future[dict]]] = {}
+
+
+def resolve_client_tool_result(
+    invocation_id: str, result: dict, run_id: int | None = None
+) -> bool:
+    """Resume a paused local tool call from the browser client."""
+    waiter = _CLIENT_TOOL_WAITERS.get(invocation_id)
+    if waiter is None:
+        return False
+    expected_run_id, future = waiter
+    if run_id is not None and expected_run_id is not None and expected_run_id != run_id:
+        return False
+    if not future.done():
+        future.set_result(result)
+    return True
+
+
+def _register_client_tool_waiter(
+    invocation_id: str, run_id: int | None
+) -> asyncio.Future[dict]:
+    future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
+    _CLIENT_TOOL_WAITERS[invocation_id] = (run_id, future)
+    return future
+
+
+async def _wait_for_client_tool(
+    invocation_id: str,
+    request: dict,
+    future: asyncio.Future[dict],
+    timeout_seconds: int,
+) -> dict:
+    try:
+        return await asyncio.wait_for(future, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "error_type": "client_tool_timeout",
+            "result": f"Client tool timed out: {request.get('tool')}",
+        }
+    finally:
+        _CLIENT_TOOL_WAITERS.pop(invocation_id, None)
+
+
+async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
+    """Stream a resumable ReAct loop one event at a time."""
+    from .security import PathGuard
+
+    user_prompt = state["user_prompt"]
+    agent_prompt = state.get("prompt") or user_prompt
+    workspace = state.get("workspace", ".")
+    settings = get_settings()
+    local_workspace = bool(state.get("local_workspace", False))
+    run_id = state.get("run_id")
+    yield AgentEvent("run.started")
+
+    if settings.tool_approval_enabled and any(
+        marker in user_prompt.lower() for marker in SENSITIVE_REQUEST_MARKERS
+    ):
+        msg = "敏感配置不会被自动读取或回显。若需要访问，请使用 read_file 工具读取 .env，系统会先请求你的明确批准。"
+        yield AgentEvent("message.delta", msg)
+        yield AgentEvent("run.finished")
+        return
+
+    guard = PathGuard(Path(workspace))
+    context = _workspace_context(Path(workspace))
+    system_prompt = _build_system_prompt(
+        context, settings.tool_approval_enabled, local_workspace
+    )
+    tool_schemas = _build_tool_schemas()
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": agent_prompt},
+    ]
+    repeat_records: dict[str, _RepeatRecord] = {}
+
+    for turn_no in range(1, getattr(settings, "react_max_turns", 128) + 1):
+        messages, compacted = _bound_react_messages(
+            messages,
+            settings.context_max_tokens,
+            getattr(settings, "context_compaction_threshold", 0.75),
+        )
+        if compacted:
+            yield AgentEvent(
+                "context.compacted",
+                f"上下文已压缩（第 {turn_no} 轮），保留目标、规则和最近工具结果。",
+            )
+
+        try:
+            response = await complete_with_tools(messages, tool_schemas, timeout=120)
+        except Exception as error:
+            yield AgentEvent("run.failed", str(error))
+            return
+
+        calls = response.tool_calls or ([response.tool_call] if response.tool_call else [])
+        if not calls:
+            if response.content:
+                yield AgentEvent("message.delta", response.content)
+            yield AgentEvent("run.finished")
+            return
+
+        if response.content:
+            yield AgentEvent("message.delta", response.content)
+
+        assistant_message = {
+            "role": "assistant",
+            "content": response.content or None,
+            "tool_calls": [call.raw for call in calls],
+        }
+        messages.append(assistant_message)
+        tool_results: list[tuple[ParsedToolCall, str, bool]] = []
+        client_requests: list[tuple[ParsedToolCall, str, dict]] = []
+        terminal_message: str | None = None
+        blocked_call_ids: set[str] = set()
+
+        for call in calls:
+            yield AgentEvent(
+                "tool.started",
+                json.dumps({"arguments": call.arguments}, ensure_ascii=False),
+                call.name,
+            )
+            try:
+                tool_spec = get_tool(call.name, caller="main")
+            except Exception as error:
+                tool_results.append((call, f"Error: {error}", False))
+                continue
+
+            signature = _call_signature(call.name, call.arguments)
+            record = repeat_records.setdefault(signature, _RepeatRecord())
+            repeat_action = (
+                "execute"
+                if tool_spec.repeat_policy == "polling"
+                else _repeat_action(record, signature)
+            )
+            if repeat_action != "execute":
+                message = (
+                    "TOOL_CIRCUIT_BROKEN: repeated tool call circuit opened; choose a different action."
+                    if repeat_action == "circuit"
+                    else "DUPLICATE_CALL_REJECTED: the same call made no progress; re-plan before retrying."
+                )
+                event_type = "tool.circuit_broken" if repeat_action == "circuit" else "tool.repeat_rejected"
+                yield AgentEvent("tool.blocked", message, call.name)
+                yield AgentEvent(event_type, message, call.name)
+                tool_results.append((call, message, False))
+                blocked_call_ids.add(call.id)
+                if repeat_action == "circuit":
+                    terminal_message = message
+                continue
+
+            if call.argument_error:
+                tool_results.append((call, f"Invalid tool arguments: {call.argument_error}", False))
+                continue
+
+            if (
+                settings.tool_approval_enabled
+                and not local_workspace
+                and tool_spec.risk.requires_approval
+            ):
+                yield AgentEvent(
+                    "approval.required",
+                    json.dumps(
+                        {
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "reason": tool_spec.risk.reason,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    call.name,
+                )
+                yield AgentEvent("run.waiting", "等待工具审批")
+                return
+
+            if local_workspace and call.name in CLIENT_TOOL_NAMES:
+                invocation_id = f"client-{uuid4().hex}"
+                request = {
+                    "invocation_id": invocation_id,
+                    "tool": call.name,
+                    "arguments": call.arguments,
+                    "execution": "client",
+                }
+                client_requests.append((call, invocation_id, request))
+                continue
+
+            if local_workspace and call.name == "task":
+                tool_results.append(
+                    (
+                        call,
+                        "LOCAL_WORKSPACE_ONLY: task delegation is unavailable in browser-local mode.",
+                        False,
+                    )
+                )
+                continue
+
+            try:
+                handler = tool_spec.handler
+                if asyncio.iscoroutinefunction(handler):
+                    result = await handler(guard=guard, **call.arguments)
+                else:
+                    result = handler(guard=guard, **call.arguments)
+                tool_results.append((call, str(result)[:12000], True))
+            except Exception as error:
+                tool_results.append((call, f"Error: {error}", False))
+
+        if client_requests:
+            client_futures = {
+                invocation_id: _register_client_tool_waiter(invocation_id, run_id)
+                for _, invocation_id, _ in client_requests
+            }
+            yield AgentEvent(
+                "tool.request",
+                json.dumps(
+                    {"calls": [request for _, _, request in client_requests]},
+                    ensure_ascii=False,
+                ),
+            )
+            client_results = await asyncio.gather(
+                *(
+                    _wait_for_client_tool(
+                        invocation_id,
+                        request,
+                        client_futures[invocation_id],
+                        getattr(settings, "client_tool_timeout_seconds", 300),
+                    )
+                    for _, invocation_id, request in client_requests
+                )
+            )
+            for (call, _, _), client_result in zip(client_requests, client_results):
+                ok = bool(client_result.get("ok", False))
+                value = str(client_result.get("result") or client_result.get("error") or "")[:12000]
+                tool_results.append((call, value, ok))
+
+        # A single assistant tool-call message must be followed by one result
+        # per call. This keeps OpenAI-compatible providers and Claude-style
+        # adapters aligned even when calls were executed in different places.
+        for call, result, ok in tool_results:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result if ok else f"Tool error: {result}",
+                }
+            )
+            yield AgentEvent("tool.finished" if ok else "tool.failed", result, call.name)
+
+            if call.id in blocked_call_ids:
+                continue
+
+            try:
+                tool_spec = get_tool(call.name, caller="main")
+                record = repeat_records[_call_signature(call.name, call.arguments)]
+                result_hash = _result_fingerprint(result)
+                workspace_after = (
+                    f"client:{result_hash}"
+                    if local_workspace and call.name in CLIENT_TOOL_NAMES and ok
+                    else _workspace_fingerprint(Path(workspace))
+                    if tool_spec.repeat_policy == "stateful"
+                    else None
+                )
+                stale = _record_tool_result(
+                    record,
+                    _call_signature(call.name, call.arguments),
+                    result,
+                    workspace_after,
+                    tool_spec.repeat_policy,
+                )
+                if stale and record.stale_streak == 3:
+                    yield AgentEvent(
+                        "tool.repeat_warning",
+                        "DUPLICATE_CALL_REPLAN: repeated result made no observable progress; choose a different tool or argument.",
+                        call.name,
+                    )
+            except Exception:
+                pass
+
+        if terminal_message:
+            yield AgentEvent("message.delta", terminal_message)
+            yield AgentEvent("run.finished")
+            return
+
+    yield AgentEvent("run.limited", "达到 Agent 最大轮次限制，任务尚未完成。")
+
+
 async def _execute(state: AgentState) -> AgentState:
+    """Collect the streaming ReAct loop for unit tests and internal callers."""
+    events: list[AgentEvent] = []
+    async for event in _run_react_stream(state):
+        events.append(event)
+    response = next(
+        (event.content for event in reversed(events) if event.type == "message.delta"),
+        "",
+    )
+    return {**state, "response": response, "events": events}
+
+
+async def _execute_legacy(state: AgentState) -> AgentState:
     """ReAct loop: LLM thinks -> calls tool -> observes -> repeats until done."""
     import asyncio
     from .security import PathGuard
@@ -432,7 +752,7 @@ async def _execute(state: AgentState) -> AgentState:
     repeat_records: dict[str, _RepeatRecord] = {}
     pending_local_writes: dict[str, str] = {}
     while True:
-        messages = _bound_react_messages(messages, settings.context_max_tokens)
+        messages, _ = _bound_react_messages(messages, settings.context_max_tokens)
         response = await complete_with_tools(messages, tool_schemas, timeout=120)
 
         # No tool call -> final answer
@@ -611,30 +931,24 @@ async def run_agent(
     thread_id: str = "default",
     context_text: str | None = None,
     local_workspace: bool = True,
+    run_id: int | None = None,
 ) -> AsyncIterator[AgentEvent]:
-    settings = get_settings()
-    connection_string = settings.database_url.replace("+asyncpg", "")
-    async with AsyncPostgresSaver.from_conn_string(connection_string) as checkpointer:
-        await checkpointer.setup()
-        graph = _builder.compile(checkpointer=checkpointer)
-        previous = "\n".join(f"{role}: {content}" for role, content in (history or [])[-20:])
-        enriched_prompt = prompt
-        if context_text:
-            enriched_prompt = f"{context_text}\n\nUser request:\n{prompt}"
-        elif previous:
-            enriched_prompt = (
-                f"Conversation history:\n{previous}\n\nUser request:\n{prompt}"
-            )
-        result = await graph.ainvoke(
-            {
-                "prompt": enriched_prompt,
-                "user_prompt": prompt,
-                "response": "",
-                "events": [],
-                "workspace": workspace,
-                "local_workspace": local_workspace,
-            },
-            config={"configurable": {"thread_id": thread_id}},
-        )
-    for event in result["events"]:
+    previous = "\n".join(
+        f"{role}: {content}" for role, content in (history or [])[-20:]
+    )
+    enriched_prompt = prompt
+    if context_text:
+        enriched_prompt = f"{context_text}\n\nUser request:\n{prompt}"
+    elif previous:
+        enriched_prompt = f"Conversation history:\n{previous}\n\nUser request:\n{prompt}"
+    state: AgentState = {
+        "prompt": enriched_prompt,
+        "user_prompt": prompt,
+        "response": "",
+        "events": [],
+        "workspace": workspace,
+        "local_workspace": local_workspace,
+        "run_id": run_id,
+    }
+    async for event in _run_react_stream(state):
         yield event

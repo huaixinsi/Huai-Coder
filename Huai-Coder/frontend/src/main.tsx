@@ -8,6 +8,7 @@ type StreamEvent = {
   type: string;
   content?: string;
   tool?: string;
+  run_id?: number;
   plan_id?: number;
   approval_id?: number;
   risk_level?: string;
@@ -23,17 +24,18 @@ type Activity = { type: string; tool?: string; arguments?: string; content?: str
 type ChatMessage = { id: string; role: "user" | "assistant" | "system"; content: string; activities: Activity[]; status?: "running" | "done" | "failed" };
 type Approval = StreamEvent;
 type DirectoryFile = { file: File; relativePath: string };
+type ClientToolCall = { invocation_id: string; tool: string; arguments: Record<string, unknown>; execution: "client" };
+type ClientToolResult = { ok: boolean; result?: string; error_type?: string; changed_paths?: string[]; content_hash?: string };
 type WorkspaceStatus = { bound: boolean; file_count: number; folder_name?: string | null };
-type RunStatus = "idle" | "running" | "waiting" | "completed" | "failed" | "stopped";
+type RunStatus = "idle" | "running" | "waiting" | "completed" | "failed" | "limited" | "stopped";
 
 declare global {
   interface Window { showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<FileSystemDirectoryHandle>; }
-  interface FileSystemDirectoryHandle { name: string; values(): AsyncIterableIterator<FileSystemFileHandle | FileSystemDirectoryHandle>; getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<FileSystemDirectoryHandle>; getFileHandle(name: string, options?: { create?: boolean }): Promise<FileSystemFileHandle>; queryPermission?(descriptor?: { mode?: "read" | "readwrite" }): Promise<PermissionState>; }
-  interface FileSystemFileHandle { kind: "file"; name: string; getFile(): Promise<File>; createWritable(): Promise<FileSystemWritableFileStream>; }
-  interface FileSystemWritableFileStream { write(data: string): Promise<void>; close(): Promise<void>; }
+  interface FileSystemDirectoryHandle { values(): AsyncIterableIterator<FileSystemFileHandle | FileSystemDirectoryHandle>; }
 }
 
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const RUNNER_URL = import.meta.env.VITE_RUNNER_URL ?? "http://127.0.0.1:8765";
 
 function Markdown({ value }: { value: string }) {
   return <ReactMarkdown remarkPlugins={[remarkGfm]}>{value}</ReactMarkdown>;
@@ -188,6 +190,12 @@ function App() {
       updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: item.type, content: item.content, status: "info" }] }));
       return;
     }
+    if (item.type === "tool.request") {
+      let details: { calls?: ClientToolCall[] } = {};
+      try { details = JSON.parse(item.content ?? "{}"); } catch { /* keep the stream usable if payload is malformed */ }
+      if (item.run_id && Array.isArray(details.calls)) void handleClientToolRequests(item.run_id, details.calls, assistantId);
+      return;
+    }
     if (item.type === "file.write") {
       let details: { path?: string; content?: string } = {};
       try { details = JSON.parse(item.content ?? "{}"); } catch { /* keep the stream usable if payload is malformed */ }
@@ -240,6 +248,11 @@ function App() {
     if (item.type === "run.finished") {
       updateMessage(assistantId, message => ({ ...message, status: "done" }));
       setRunStatus(current => current === "waiting" ? current : "completed");
+      return;
+    }
+    if (item.type === "run.limited") {
+      updateMessage(assistantId, message => ({ ...message, status: "failed", content: message.content || item.content || "本轮已达到最大执行轮次，任务尚未完成。" }));
+      setRunStatus("limited");
       return;
     }
     if (item.type === "run.failed") {
@@ -351,8 +364,66 @@ function App() {
     setFolderError("当前浏览器只能上传文件夹，无法获得写回权限；请使用最新版 Chrome 或 Edge 进行代码同步。");
   }
 
-  async function writeBoundFile(projectId: number | null, relativePath: string, content: string) {
-    if (!projectId) return;
+  function localPathParts(relativePath: string): string[] {
+    const normalized = relativePath.replaceAll("\\", "/").trim();
+    if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) throw new Error("Invalid local file path");
+    const parts = normalized.split("/").filter(Boolean);
+    if (!parts.length || parts.some(part => part === "." || part === "..")) throw new Error("Invalid local file path");
+    return parts;
+  }
+
+  async function directoryAt(root: FileSystemDirectoryHandle, relativePath: string): Promise<FileSystemDirectoryHandle> {
+    let directory = root;
+    const parts = relativePath === "." || !relativePath ? [] : localPathParts(relativePath);
+    for (const part of parts) directory = await directory.getDirectoryHandle(part);
+    return directory;
+  }
+
+  async function fileAt(root: FileSystemDirectoryHandle, relativePath: string): Promise<{ file: File; path: string }> {
+    const parts = localPathParts(relativePath);
+    const directory = await directoryAt(root, parts.slice(0, -1).join("/") || ".");
+    const handle = await directory.getFileHandle(parts[parts.length - 1]);
+    return { file: await handle.getFile(), path: parts.join("/") };
+  }
+
+  async function listLocalDirectory(root: FileSystemDirectoryHandle, relativePath: string): Promise<string> {
+    const directory = await directoryAt(root, relativePath || ".");
+    const entries: string[] = [];
+    for await (const entry of directory.values()) {
+      if (entry.name.startsWith(".") && entry.name !== ".env.example") continue;
+      entries.push(entry.kind === "directory" ? `${entry.name}/` : entry.name);
+    }
+    return entries.sort().join("\n") || "(empty)";
+  }
+
+  async function grepLocalDirectory(root: FileSystemDirectoryHandle, query: string, relativePath: string): Promise<string> {
+    const matches: string[] = [];
+    const walk = async (directory: FileSystemDirectoryHandle, prefix: string): Promise<void> => {
+      if (matches.length >= 200) return;
+      for await (const entry of directory.values()) {
+        if (matches.length >= 200) return;
+        if (entry.name.startsWith(".") && entry.name !== ".env.example") continue;
+        if (entry.kind === "directory") {
+          if (!skipDirs.has(entry.name)) await walk(entry, prefix ? `${prefix}/${entry.name}` : entry.name);
+          continue;
+        }
+        const extension = entry.name.includes(".") ? `.${entry.name.split(".").pop()!.toLowerCase()}` : "";
+        if (skipExtensions.has(extension)) continue;
+        const file = await entry.getFile();
+        if (file.size > maxFileSize) continue;
+        const lines: string[] = (await file.text()).split(/\r?\n/);
+        lines.forEach((line: string, index: number) => {
+          if (matches.length < 200 && line.toLowerCase().includes(query.toLowerCase())) matches.push(`${prefix ? `${prefix}/` : ""}${entry.name}:${index + 1}:${line.trim()}`);
+        });
+      }
+    };
+    const startPath = relativePath && relativePath !== "." ? localPathParts(relativePath).join("/") : ".";
+    await walk(await directoryAt(root, startPath), startPath === "." ? "" : startPath);
+    return matches.join("\n") || "No matches";
+  }
+
+  async function writeBoundFileLegacy(projectId: number | null, relativePath: string, content: string) {
+    if (!projectId) return { ok: false, error_type: "workspace_not_bound", result: "No local workspace is bound." };
     const handle = folderHandlesRef.current.get(projectId);
     if (!handle) {
       setFolderWritable(false);
@@ -376,12 +447,125 @@ function App() {
     } catch (error) {
       setFolderWritable(false);
       setFolderError(error instanceof Error ? error.message : "本地文件写入失败，请重新绑定文件夹后重试。");
+      return { ok: false, error_type: "local_write_failed", result: error instanceof Error ? error.message : "Local file write failed." };
     }
   }
-  function queueBoundFile(projectId: number | null, relativePath: string, content: string) {
-    localWriteQueueRef.current = localWriteQueueRef.current.then(() => writeBoundFile(projectId, relativePath, content));
-    return localWriteQueueRef.current;
+  async function writeBoundFile(projectId: number | null, relativePath: string, content: string): Promise<ClientToolResult> {
+    if (!projectId) return { ok: false, error_type: "workspace_not_bound", result: "No local workspace is bound." };
+    const handle = folderHandlesRef.current.get(projectId);
+    if (!handle) {
+      setFolderWritable(false);
+      setFolderError("No writable local workspace is bound.");
+      return { ok: false, error_type: "workspace_not_bound", result: "No writable local workspace is bound." };
+    }
+    try {
+      const parts = localPathParts(relativePath);
+      let directory = handle;
+      for (const part of parts.slice(0, -1)) directory = await directory.getDirectoryHandle(part, { create: true });
+      const target = await directory.getFileHandle(parts[parts.length - 1], { create: true });
+      const writable = await target.createWritable();
+      try {
+        await writable.write(content);
+      } finally {
+        await writable.close();
+      }
+      if (selectedProject === projectId) setFolderSyncMessage(`Wrote ${relativePath} to the bound local workspace.`);
+      return { ok: true, result: `Wrote ${relativePath}`, changed_paths: [parts.join("/")] };
+    } catch (error) {
+      setFolderWritable(false);
+      const message = error instanceof Error ? error.message : "Local file write failed.";
+      setFolderError(message);
+      return { ok: false, error_type: "local_write_failed", result: message };
+    }
   }
+
+  function queueBoundFile(projectId: number | null, relativePath: string, content: string): Promise<ClientToolResult> {
+    const result = localWriteQueueRef.current.then(() => writeBoundFile(projectId, relativePath, content));
+    localWriteQueueRef.current = result.then(() => undefined);
+    return result;
+  }
+
+  async function executeLocalCommand(call: ClientToolCall): Promise<ClientToolResult> {
+    const args = call.arguments ?? {};
+    if (typeof args.command !== "string" || !args.command.trim()) {
+      return { ok: false, error_type: "invalid_arguments", result: "execute_command requires command." };
+    }
+    try {
+      const response = await fetch(`${RUNNER_URL}/v1/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          command: args.command,
+          auto_prepare: args.auto_prepare !== false,
+          timeout_seconds: typeof args.timeout_seconds === "number" ? args.timeout_seconds : 120,
+        }),
+      });
+      const payload = await response.json().catch(() => ({})) as { ok?: boolean; result?: string; error_type?: string; dependency_steps?: Array<{ ecosystem?: string; manifest?: string; ok?: boolean; attempts?: Array<{ command?: string; output?: string }> }>; changed_paths?: string[] };
+      if (!response.ok) return { ok: false, error_type: "runner_http_error", result: `Local Runner returned HTTP ${response.status}.` };
+      const dependencyLog = (payload.dependency_steps ?? []).map(step => `${step.ok ? "prepared" : "failed"} ${step.ecosystem ?? "dependency"} (${step.manifest ?? "manifest"})`).join("\n");
+      const result = [dependencyLog, payload.result ?? ""].filter(Boolean).join("\n\n");
+      return {
+        ok: payload.ok === true,
+        // Keep the response within the backend's Pydantic request limit even
+        // when the runner returned a full, capped command output plus logs.
+        result: result.slice(0, 19_000),
+        error_type: payload.error_type,
+        changed_paths: payload.changed_paths ?? [],
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error_type: "runner_unavailable",
+        result: `Local Runner is unavailable at ${RUNNER_URL}. Start it with: python -m app.runner_server --workspace <your-folder>. (${error instanceof Error ? error.message : "connection failed"})`,
+      };
+    }
+  }
+
+  async function executeClientTool(projectId: number | null, call: ClientToolCall): Promise<ClientToolResult> {
+    const handle = projectId ? folderHandlesRef.current.get(projectId) : undefined;
+    if (!handle) return { ok: false, error_type: "workspace_not_bound", result: "No writable local workspace is bound." };
+    const args = call.arguments ?? {};
+    try {
+      if (call.tool === "execute_command") return await executeLocalCommand(call);
+      if (call.tool === "list_dir") {
+        return { ok: true, result: await listLocalDirectory(handle, typeof args.path === "string" ? args.path : ".") };
+      }
+      if (call.tool === "read_file") {
+        const target = await fileAt(handle, String(args.path ?? ""));
+        const text = await target.file.text();
+        return { ok: true, result: text.length > 12000 ? `${text.slice(0, 12000)}\n[truncated]` : text };
+      }
+      if (call.tool === "grep_code") {
+        const query = typeof args.query === "string" ? args.query : "";
+        if (!query) return { ok: false, error_type: "invalid_arguments", result: "grep_code requires query." };
+        return { ok: true, result: await grepLocalDirectory(handle, query, typeof args.path === "string" ? args.path : ".") };
+      }
+      if (call.tool === "write_file") {
+        if (typeof args.path !== "string" || typeof args.content !== "string") return { ok: false, error_type: "invalid_arguments", result: "write_file requires path and content." };
+        return await queueBoundFile(projectId, args.path, args.content);
+      }
+      return { ok: false, error_type: "unsupported_client_tool", result: `Unsupported client tool: ${call.tool}` };
+    } catch (error) {
+      return { ok: false, error_type: "client_tool_failed", result: error instanceof Error ? error.message : "Client tool failed." };
+    }
+  }
+
+  async function handleClientToolRequests(runId: number, calls: ClientToolCall[], assistantId: string) {
+    for (const call of calls) {
+      const result = await executeClientTool(selectedProject, call);
+      try {
+        const response = await fetch(`${API}/api/runs/${runId}/tool-results`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ invocation_id: call.invocation_id, ...result }),
+        });
+        if (!response.ok) throw new Error(`Tool result rejected (${response.status})`);
+      } catch (error) {
+        updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: "tool", tool: call.tool, content: error instanceof Error ? error.message : "Tool result submission failed.", status: "error" }] }));
+      }
+    }
+  }
+
   async function uploadFiles(event: React.ChangeEvent<HTMLInputElement>) {
     if (!selectedProject || !event.target.files?.length) return;
     const items = Array.from(event.target.files).map(file => ({ file, relativePath: file.name }));
@@ -440,6 +624,8 @@ function App() {
       ? { kind: "running", label: "进行中" }
       : runStatus === "completed"
         ? { kind: "completed", label: "已完成" }
+        : runStatus === "limited"
+          ? { kind: "limited", label: "达到执行上限" }
         : runStatus === "failed"
           ? { kind: "failed", label: "执行失败" }
           : runStatus === "stopped"
