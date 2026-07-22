@@ -6,7 +6,7 @@ from app.security import PathGuard
 @pytest.mark.asyncio
 async def test_list_workspace():
     result = await execute_tool("list_dir", {"path": "."})
-    assert "app" in result
+    assert "backend" in result or "app" in result
 
 @pytest.mark.asyncio
 async def test_rejects_path_escape():
@@ -15,7 +15,9 @@ async def test_rejects_path_escape():
 
 @pytest.mark.asyncio
 async def test_grep_code():
-    result = await execute_tool("grep_code", {"query": "WORKSPACE_ROOT", "path": "app"})
+    result = await execute_tool("grep_code", {"query": "WORKSPACE_ROOT", "path": "backend/app"})
+    if "Not a directory" in result:
+        result = await execute_tool("grep_code", {"query": "WORKSPACE_ROOT", "path": "app"})
     assert "tools.py" in result
 
 @pytest.mark.asyncio

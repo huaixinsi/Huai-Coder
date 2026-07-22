@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -17,12 +17,22 @@ class ParsedToolCall:
     name: str
     arguments: dict[str, Any]
     raw: dict[str, Any]  # original tool_call dict for message history
+    argument_error: str | None = None
 
 
 @dataclass
 class LLMResponse:
     content: str
     tool_call: ParsedToolCall | None = None
+    tool_calls: list[ParsedToolCall] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Keep the old single-call field source-compatible while exposing all
+        # calls from providers that support parallel tool use.
+        if self.tool_call is not None and not self.tool_calls:
+            self.tool_calls = [self.tool_call]
+        elif self.tool_calls and self.tool_call is None:
+            self.tool_call = self.tool_calls[0]
 
 
 async def complete(prompt: str | list[dict], timeout: int = 60) -> str:
@@ -79,27 +89,38 @@ async def complete_with_tools(
         response.raise_for_status()
         choice = response.json()["choices"][0]["message"]
 
-    # Parse tool_calls if present
+    # Parse every tool call in the assistant turn. Do not silently discard
+    # additional calls: the ReAct scheduler decides whether they can run in
+    # parallel or must be serialized.
     tool_calls = choice.get("tool_calls")
     if tool_calls:
-        tc = tool_calls[0]
-        fn = tc["function"]
-        try:
-            arguments = (
-                json.loads(fn["arguments"])
-                if isinstance(fn["arguments"], str)
-                else fn["arguments"]
+        parsed_calls: list[ParsedToolCall] = []
+        for index, tc in enumerate(tool_calls):
+            fn = tc.get("function") or {}
+            argument_error = None
+            try:
+                arguments = (
+                    json.loads(fn.get("arguments", "{}"))
+                    if isinstance(fn.get("arguments"), str)
+                    else fn.get("arguments", {})
+                )
+                if not isinstance(arguments, dict):
+                    raise TypeError("tool arguments must be a JSON object")
+            except (json.JSONDecodeError, TypeError) as error:
+                arguments = {}
+                argument_error = str(error)
+            parsed_calls.append(
+                ParsedToolCall(
+                    id=tc.get("id", f"call_{index}"),
+                    name=fn.get("name", ""),
+                    arguments=arguments,
+                    raw=tc,
+                    argument_error=argument_error,
+                )
             )
-        except (json.JSONDecodeError, TypeError):
-            arguments = {}
         return LLMResponse(
             content=choice.get("content") or "",
-            tool_call=ParsedToolCall(
-                id=tc.get("id", "call_0"),
-                name=fn["name"],
-                arguments=arguments,
-                raw=tc,
-            ),
+            tool_calls=parsed_calls,
         )
 
     return LLMResponse(content=choice.get("content") or "")

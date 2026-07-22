@@ -51,7 +51,8 @@ def test_react_context_compacts_complete_tool_pairs():
             {"role": "assistant", "content": None, "tool_calls": [{"id": str(index)}]},
             {"role": "tool", "tool_call_id": str(index), "content": "x" * 500},
         ])
-    compacted = _bound_react_messages(messages, 300)
+    compacted, was_compacted = _bound_react_messages(messages, 300)
+    assert was_compacted is True
     assert len(compacted) < len(messages)
     assert compacted[0]["role"] == "system"
     assert compacted[1]["role"] == "user"

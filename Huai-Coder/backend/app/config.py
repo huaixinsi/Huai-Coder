@@ -16,8 +16,10 @@ class Settings(BaseSettings):
     memory_retention_days: int = 90
     context_compaction_enabled: bool = True
     context_max_tokens: int = 32768
+    context_compaction_threshold: float = 0.75
+    react_max_turns: int = 128
+    client_tool_timeout_seconds: int = 300
     tool_approval_enabled: bool = False
-    context_compaction_threshold: float = 0.8
     context_recent_turns: int = 8
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     @property

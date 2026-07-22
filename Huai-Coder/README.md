@@ -82,7 +82,7 @@ MEMORY_RETENTION_DAYS=90
 CONTEXT_COMPACTION_ENABLED=true
 CONTEXT_MAX_TOKENS=32768
 TOOL_APPROVAL_ENABLED=false
-CONTEXT_COMPACTION_THRESHOLD=0.8
+CONTEXT_COMPACTION_THRESHOLD=0.75
 CONTEXT_RECENT_TURNS=8
 ```
 
@@ -151,6 +151,7 @@ Huai-Coder/
 
 ```powershell
 cd frontend
+npm.cmd run typecheck
 npm.cmd run build
 ```
 
@@ -174,3 +175,4 @@ Invoke-RestMethod http://localhost:8000/health
 - 修改后运行前端构建、后端测试和 Docker 验证。
 - 阶段完成后提交 Pull Request。
 - 不提交真实密钥、密码、Token、Cookie 或私钥。
+- [Local Runner 自动依赖安装与本地执行](docs/local-runner.md)

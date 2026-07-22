@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install --no-cache-dir fastapi uvicorn[standard] sqlalchemy[asyncio] asyncpg "psycopg[binary]" pydantic-settings langgraph langgraph-checkpoint-postgres httpx alembic python-multipart
+COPY backend/pyproject.toml ./pyproject.toml
+RUN pip install --no-cache-dir ".[test]"
 COPY backend/app ./app
 COPY backend/alembic.ini ./alembic.ini
 COPY backend/migrations ./migrations

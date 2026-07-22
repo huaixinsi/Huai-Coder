@@ -15,7 +15,7 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from .agent import AgentEvent, run_agent
+from .agent import AgentEvent, resolve_client_tool_result, run_agent
 from .context import ContextManager
 from .memory import (
     GLOBAL_MEMORY_SCOPE_ID,
@@ -497,6 +497,15 @@ class RunRequest(BaseModel):
     local_workspace: bool = True
 
 
+class ClientToolResultRequest(BaseModel):
+    invocation_id: str = Field(min_length=1, max_length=200)
+    ok: bool
+    result: str = Field(default="", max_length=20000)
+    error_type: str | None = Field(default=None, max_length=100)
+    changed_paths: list[str] = Field(default_factory=list, max_length=100)
+    content_hash: str | None = Field(default=None, max_length=128)
+
+
 @app.post("/api/runs")
 async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
     session = await db.get(Session, request.session_id)
@@ -554,6 +563,7 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                 thread_id=f"session-{session.id}",
                 context_text=prepared_context.render(),
                 local_workspace=request.local_workspace,
+                run_id=run.id,
             ):
                 event_payload = {
                     "run_id": run.id,
@@ -604,10 +614,16 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                         tool=event.tool,
                     )
                 )
-                if event.type in {"run.finished", "run.failed"}:
+                if event.type in {"run.finished", "run.failed", "run.limited"}:
                     run.status = (
-                        "completed" if event.type == "run.finished" else "failed"
-                )
+                        "completed"
+                        if event.type == "run.finished"
+                        else "limited"
+                        if event.type == "run.limited"
+                        else "failed"
+                    )
+                elif event.type == "run.waiting":
+                    run.status = "waiting"
                 if event.type == "message.delta":
                     db.add(
                         Message(
@@ -655,6 +671,26 @@ async def list_run_events(run_id: int, db: AsyncSession = Depends(get_db)):
             .order_by(AgentEventRecord.id)
         )
     ).all()
+
+
+@app.post("/api/runs/{run_id}/tool-results")
+async def submit_client_tool_result(
+    run_id: int,
+    request: ClientToolResultRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    if await db.get(AgentRun, run_id) is None:
+        raise HTTPException(404, "Run not found")
+    accepted = resolve_client_tool_result(
+        request.invocation_id, request.model_dump(), run_id
+    )
+    if not accepted:
+        raise HTTPException(409, "Client tool invocation is not pending")
+    return {
+        "run_id": run_id,
+        "invocation_id": request.invocation_id,
+        "accepted": True,
+    }
 
 
 async def _get_approval(approval_id: int, db: AsyncSession) -> Approval:
@@ -775,6 +811,7 @@ async def _continue_after_approval(
             thread_id=f"session-{session.id}-approval-{approval.id}",
             context_text=prepared_context.render(),
             local_workspace=True,
+            run_id=run.id,
         ):
             event_payload = {
                 "run_id": run.id,
