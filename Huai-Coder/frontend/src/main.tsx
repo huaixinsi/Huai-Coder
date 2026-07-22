@@ -24,7 +24,6 @@ type ChatMessage = { id: string; role: "user" | "assistant" | "system"; content:
 type Approval = StreamEvent;
 type DirectoryFile = { file: File; relativePath: string };
 type WorkspaceStatus = { bound: boolean; file_count: number; folder_name?: string | null };
-type WorkspaceFile = { path: string; content: string };
 type RunStatus = "idle" | "running" | "waiting" | "completed" | "failed" | "stopped";
 
 declare global {
@@ -78,6 +77,7 @@ function App() {
   const [folderSyncMessage, setFolderSyncMessage] = useState("");
   const [uploading, setUploading] = useState(false);
   const folderHandlesRef = useRef<Map<number, FileSystemDirectoryHandle>>(new Map());
+  const localWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [approval, setApproval] = useState<Approval | null>(null);
   const [approvalAssistantId, setApprovalAssistantId] = useState<string | null>(null);
   const [approvalError, setApprovalError] = useState("");
@@ -188,6 +188,14 @@ function App() {
       updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: item.type, content: item.content, status: "info" }] }));
       return;
     }
+    if (item.type === "file.write") {
+      let details: { path?: string; content?: string } = {};
+      try { details = JSON.parse(item.content ?? "{}"); } catch { /* keep the stream usable if payload is malformed */ }
+      if (details.path && typeof details.content === "string") {
+        void queueBoundFile(selectedProject, details.path, details.content);
+      }
+      return;
+    }
     if (item.type === "tool.repeat_warning" || item.type === "tool.repeat_rejected" || item.type === "tool.circuit_broken") {
       updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: "guard", tool: item.tool, content: item.content, status: "info" }] }));
       return;
@@ -251,12 +259,11 @@ function App() {
       return;
     }
     const value = prompt.trim();
-    const projectId = selectedProject;
     const assistantId = `assistant-${Date.now()}`;
     setPrompt(""); setRunning(true); setRunStatus("running");
     setChatMessages(current => [...current, { id: `user-${Date.now()}`, role: "user", content: value, activities: [], status: "done" }, { id: assistantId, role: "assistant", content: "", activities: [], status: "running" }]);
     try {
-      const response = await fetch(`${API}/api/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: value, project_id: selectedProject, session_id: selectedSession }) });
+      const response = await fetch(`${API}/api/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: value, project_id: selectedProject, session_id: selectedSession, local_workspace: true }) });
       if (!response.ok) throw new Error(`请求失败 (${response.status})`);
       const reader = response.body?.getReader();
       if (!reader) throw new Error("浏览器不支持流式响应");
@@ -282,7 +289,7 @@ function App() {
       setRunStatus("failed");
       updateMessage(assistantId, message => ({ ...message, status: "failed", content: error instanceof Error ? error.message : "请求失败" }));
     } finally {
-      await syncBoundFolder(projectId);
+      await localWriteQueueRef.current;
       setRunning(false);
     }
   }
@@ -344,33 +351,36 @@ function App() {
     setFolderError("当前浏览器只能上传文件夹，无法获得写回权限；请使用最新版 Chrome 或 Edge 进行代码同步。");
   }
 
-  async function syncBoundFolder(projectId: number | null) {
+  async function writeBoundFile(projectId: number | null, relativePath: string, content: string) {
     if (!projectId) return;
     const handle = folderHandlesRef.current.get(projectId);
-    if (!handle) return;
+    if (!handle) {
+      setFolderWritable(false);
+      setFolderError("当前会话没有可写文件夹，请重新绑定。");
+      return;
+    }
     try {
-      if (handle.queryPermission && await handle.queryPermission({ mode: "readwrite" }) !== "granted") {
-        setFolderWritable(false);
-        setFolderError("文件夹写入权限已失效，请重新绑定文件夹后再试。");
-        return;
-      }
-      const response = await fetch(`${API}/api/projects/${projectId}/workspace/files`);
-      if (!response.ok) throw new Error(`同步文件失败 (${response.status})`);
-      const payload = await response.json() as { files: WorkspaceFile[] };
-      for (const file of payload.files) {
-        const parts = file.path.replaceAll("\\", "/").split("/").filter(Boolean);
-        if (!parts.length) continue;
-        let directory = handle;
-        for (const part of parts.slice(0, -1)) directory = await directory.getDirectoryHandle(part, { create: true });
-        const target = await directory.getFileHandle(parts[parts.length - 1], { create: true });
-        const writable = await target.createWritable();
-        await writable.write(file.content);
+      const parts = relativePath.replaceAll("\\", "/").split("/").filter(Boolean);
+      if (!parts.length) return;
+      if (parts.some(part => part === "." || part === "..")) throw new Error("文件路径无效");
+      let directory = handle;
+      for (const part of parts.slice(0, -1)) directory = await directory.getDirectoryHandle(part, { create: true });
+      const target = await directory.getFileHandle(parts[parts.length - 1], { create: true });
+      const writable = await target.createWritable();
+      try {
+        await writable.write(content);
+      } finally {
         await writable.close();
       }
-      if (selectedProject === projectId) setFolderSyncMessage(`已将 ${payload.files.length} 个文件同步回绑定文件夹`);
+      if (selectedProject === projectId) setFolderSyncMessage(`已将 ${relativePath} 写入本地绑定文件夹`);
     } catch (error) {
-      setFolderError(error instanceof Error ? error.message : "代码同步失败，请重新绑定文件夹后重试。");
+      setFolderWritable(false);
+      setFolderError(error instanceof Error ? error.message : "本地文件写入失败，请重新绑定文件夹后重试。");
     }
+  }
+  function queueBoundFile(projectId: number | null, relativePath: string, content: string) {
+    localWriteQueueRef.current = localWriteQueueRef.current.then(() => writeBoundFile(projectId, relativePath, content));
+    return localWriteQueueRef.current;
   }
   async function uploadFiles(event: React.ChangeEvent<HTMLInputElement>) {
     if (!selectedProject || !event.target.files?.length) return;
@@ -412,13 +422,13 @@ function App() {
       });
       const continuationEvents = result.continuation_events ?? [];
       for (const event of continuationEvents) handleStreamEvent(event, activeAssistantId ?? "");
-      if (action === "approve") await syncBoundFolder(selectedProject);
       if (continuationEvents.length === 0) setRunStatus(action === "approve" ? "completed" : "stopped");
       if (action !== "approve") setRunStatus("stopped");
     } catch (error) {
       setRunStatus("failed");
       setApprovalError(error instanceof Error ? error.message : "审批请求失败，请稍后重试。");
     } finally {
+      await localWriteQueueRef.current;
       setApprovalBusy(false); setRunning(false);
     }
   }

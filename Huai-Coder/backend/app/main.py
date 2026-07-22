@@ -492,6 +492,9 @@ class RunRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=12000)
     project_id: int
     session_id: int
+    # Code changes are proposed to the browser and written through the user's
+    # File System Access handle instead of being persisted in the container.
+    local_workspace: bool = True
 
 
 @app.post("/api/runs")
@@ -550,6 +553,7 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                 history=None,
                 thread_id=f"session-{session.id}",
                 context_text=prepared_context.render(),
+                local_workspace=request.local_workspace,
             ):
                 event_payload = {
                     "run_id": run.id,
@@ -770,6 +774,7 @@ async def _continue_after_approval(
             history=None,
             thread_id=f"session-{session.id}-approval-{approval.id}",
             context_text=prepared_context.render(),
+            local_workspace=True,
         ):
             event_payload = {
                 "run_id": run.id,

@@ -12,7 +12,7 @@ from app.security import Risk
 
 
 class AgentBudgetTests(unittest.TestCase):
-    def _run_agent(self, *, responses: list[LLMResponse], tool: ToolSpec | None = None):
+    def _run_agent(self, *, responses: list[LLMResponse], tool: ToolSpec | None = None, local_workspace: bool = False):
         calls = []
         fake_tool = tool or ToolSpec(
             "list_dir",
@@ -33,6 +33,7 @@ class AgentBudgetTests(unittest.TestCase):
                 "workspace": temporary,
                 "response": "",
                 "events": [],
+                "local_workspace": local_workspace,
             }
             with patch("app.agent.get_settings", return_value=settings), patch(
                 "app.agent._workspace_context", return_value="context"
@@ -196,6 +197,44 @@ class AgentBudgetTests(unittest.TestCase):
         self.assertEqual(result["response"], "done")
         self.assertTrue(any(event.type == "tool.finished" for event in result["events"]))
         self.assertFalse(any(event.type == "approval.required" for event in result["events"]))
+
+    def test_local_workspace_emits_file_write_without_calling_container_handler(self):
+        writes = []
+
+        def container_write(guard, path, content):
+            writes.append((path, content))
+            return "container write should not run"
+
+        tool = ToolSpec(
+            "write_file",
+            "test write tool",
+            Risk("high", "test write", True),
+            container_write,
+            "stateful",
+        )
+        responses = [
+            LLMResponse(
+                content="",
+                tool_call=ParsedToolCall(
+                    id="local-write",
+                    name="write_file",
+                    arguments={"path": "src/app.py", "content": "print('ok')\n"},
+                    raw={"id": "local-write"},
+                ),
+            ),
+            LLMResponse(content="done"),
+        ]
+
+        result, calls = self._run_agent(
+            responses=responses, tool=tool, local_workspace=True
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(writes, [])
+        write_events = [event for event in result["events"] if event.type == "file.write"]
+        self.assertEqual(len(write_events), 1)
+        self.assertIn('"path": "src/app.py"', write_events[0].content)
+        self.assertEqual(result["response"], "done")
 
 if __name__ == "__main__":
     unittest.main()
