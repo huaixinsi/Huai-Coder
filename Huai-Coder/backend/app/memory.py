@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import re
 from typing import Iterable
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings
@@ -15,6 +15,7 @@ from .models import Memory, MemoryAudit
 
 MEMORY_TYPES = {"fact", "preference", "decision", "constraint", "task", "summary"}
 MEMORY_SCOPES = {"user", "project", "session"}
+GLOBAL_MEMORY_SCOPE_ID = 0
 ACTIVE_STATUSES = {"active"}
 
 _SENSITIVE_PATTERNS = (
@@ -159,6 +160,65 @@ class MemoryService:
         if not include_expired:
             query = query.where(Memory.status == "active")
         return list((await db.scalars(query.order_by(Memory.importance.desc(), Memory.id.desc()))).all())
+
+    async def list_project_and_global_memories(
+        self,
+        db: AsyncSession,
+        project_id: int,
+        *,
+        include_expired: bool = False,
+        global_scope_id: int = GLOBAL_MEMORY_SCOPE_ID,
+    ) -> dict[str, list[Memory]]:
+        """Return project memories together with application-wide user memories."""
+        scope_filter = or_(
+            and_(Memory.scope_type == "project", Memory.scope_id == project_id),
+            and_(Memory.scope_type == "user", Memory.scope_id == global_scope_id),
+        )
+        query = select(Memory).where(scope_filter)
+        if not include_expired:
+            query = query.where(Memory.status == "active")
+        rows = list(
+            (
+                await db.scalars(
+                    query.order_by(Memory.importance.desc(), Memory.id.desc())
+                )
+            ).all()
+        )
+        return {
+            "project": [memory for memory in rows if memory.scope_type == "project"],
+            "global": [memory for memory in rows if memory.scope_type == "user"],
+        }
+
+    async def list_session_project_user_memories(
+        self,
+        db: AsyncSession,
+        session_id: int,
+        project_id: int,
+        *,
+        include_expired: bool = False,
+        user_scope_id: int = GLOBAL_MEMORY_SCOPE_ID,
+    ) -> dict[str, list[Memory]]:
+        """Return memories visible from one session, grouped by scope."""
+        scope_filter = or_(
+            and_(Memory.scope_type == "session", Memory.scope_id == session_id),
+            and_(Memory.scope_type == "project", Memory.scope_id == project_id),
+            and_(Memory.scope_type == "user", Memory.scope_id == user_scope_id),
+        )
+        query = select(Memory).where(scope_filter)
+        if not include_expired:
+            query = query.where(Memory.status == "active")
+        rows = list(
+            (
+                await db.scalars(
+                    query.order_by(Memory.importance.desc(), Memory.id.desc())
+                )
+            ).all()
+        )
+        return {
+            "session": [memory for memory in rows if memory.scope_type == "session"],
+            "project": [memory for memory in rows if memory.scope_type == "project"],
+            "user": [memory for memory in rows if memory.scope_type == "user"],
+        }
 
     async def search(
         self,
