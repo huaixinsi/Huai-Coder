@@ -5,16 +5,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.agent import AgentEvent, _execute
+from app.agent import _execute
 from app.llm import LLMResponse, ParsedToolCall
 from app.registry import ToolSpec
 from app.security import Risk
 
 
 class AgentBudgetTests(unittest.TestCase):
-    def _run_agent(self, *, budget: int, responses: list[LLMResponse]):
+    def _run_agent(self, *, responses: list[LLMResponse], tool: ToolSpec | None = None):
         calls = []
-        fake_tool = ToolSpec(
+        fake_tool = tool or ToolSpec(
             "list_dir",
             "test tool",
             Risk("low", "test", False),
@@ -25,7 +25,7 @@ class AgentBudgetTests(unittest.TestCase):
             calls.append(messages)
             return responses[len(calls) - 1]
 
-        settings = SimpleNamespace(context_max_tokens=100000, agent_token_budget=budget)
+        settings = SimpleNamespace(context_max_tokens=100000, tool_approval_enabled=False)
         with tempfile.TemporaryDirectory() as temporary:
             state = {
                 "prompt": "test",
@@ -56,7 +56,7 @@ class AgentBudgetTests(unittest.TestCase):
             for index in range(16)
         ] + [LLMResponse(content="done")]
 
-        result, calls = self._run_agent(budget=100000, responses=responses)
+        result, calls = self._run_agent(responses=responses)
 
         self.assertEqual(len(calls), 17)
         self.assertEqual(
@@ -65,26 +65,137 @@ class AgentBudgetTests(unittest.TestCase):
         )
         self.assertEqual(result["response"], "done")
 
-    def test_token_budget_stops_before_next_model_call(self):
+    def test_agent_has_no_cumulative_token_cutoff(self):
         responses = [
             LLMResponse(
                 content="",
                 tool_call=ParsedToolCall(
-                    id="call-1",
+                    id=f"call-{index}",
                     name="list_dir",
-                    arguments={"path": "."},
-                    raw={"id": "call-1"},
+                    arguments={"path": f"path-{index}"},
+                    raw={"id": f"call-{index}"},
                 ),
-            ),
-            LLMResponse(content="should not be called"),
+            )
+            for index in range(40)
+        ] + [LLMResponse(content="done")]
+
+        result, calls = self._run_agent(responses=responses)
+
+        self.assertEqual(len(calls), 41)
+        self.assertEqual(result["response"], "done")
+
+    def test_repeated_call_replans_rejects_then_circuits(self):
+        responses = [
+            LLMResponse(
+                content="",
+                tool_call=ParsedToolCall(
+                    id=f"repeat-{index}",
+                    name="list_dir",
+                    arguments={"path": " ./ "},
+                    raw={"id": f"repeat-{index}"},
+                ),
+            )
+            for index in range(5)
         ]
 
-        result, calls = self._run_agent(budget=20, responses=responses)
+        result, calls = self._run_agent(responses=responses)
 
-        self.assertEqual(len(calls), 1)
-        self.assertIn("Token 预算", result["response"])
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(len([event for event in result["events"] if event.type == "tool.started"]), 3)
+        self.assertEqual(len([event for event in result["events"] if event.type == "tool.blocked"]), 2)
+        self.assertTrue(any(event.type == "tool.repeat_warning" for event in result["events"]))
+        self.assertTrue(any(event.type == "tool.repeat_rejected" for event in result["events"]))
+        self.assertTrue(any(event.type == "tool.circuit_broken" for event in result["events"]))
+        self.assertIn("TOOL_CIRCUIT_BROKEN", result["response"])
+
+    def test_stateful_progress_is_not_treated_as_stale(self):
+        counter = {"value": 0}
+
+        def stateful_tool(guard, path, content):
+            counter["value"] += 1
+            target = guard.resolve(path)
+            target.write_text(str(counter["value"]), encoding="utf-8")
+            return "updated"
+
+        tool = ToolSpec(
+            "write_file",
+            "test stateful tool",
+            Risk("high", "test write", True),
+            stateful_tool,
+            "stateful",
+        )
+        responses = [
+            LLMResponse(
+                content="",
+                tool_call=ParsedToolCall(
+                    id=f"state-{index}",
+                    name="write_file",
+                    arguments={"path": "state.txt", "content": "same"},
+                    raw={"id": f"state-{index}"},
+                ),
+            )
+            for index in range(5)
+        ] + [LLMResponse(content="done")]
+
+        result, calls = self._run_agent(responses=responses, tool=tool)
+
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(result["response"], "done")
+        self.assertFalse(any(event.type == "tool.repeat_warning" for event in result["events"]))
+
+    def test_polling_tool_is_exempt(self):
+        tool = ToolSpec(
+            "poll_status",
+            "test polling tool",
+            Risk("low", "test polling", False),
+            lambda guard: "waiting",
+            "polling",
+        )
+        responses = [
+            LLMResponse(
+                content="",
+                tool_call=ParsedToolCall(
+                    id=f"poll-{index}",
+                    name="poll_status",
+                    arguments={},
+                    raw={"id": f"poll-{index}"},
+                ),
+            )
+            for index in range(5)
+        ] + [LLMResponse(content="done")]
+
+        result, calls = self._run_agent(responses=responses, tool=tool)
+
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(result["response"], "done")
+        self.assertFalse(any(event.type == "tool.repeat_warning" for event in result["events"]))
+
+    def test_high_risk_tool_runs_without_approval_when_disabled(self):
+        responses = [
+            LLMResponse(
+                content="",
+                tool_call=ParsedToolCall(
+                    id="write-call",
+                    name="write_file",
+                    arguments={"path": "note.txt", "content": "updated"},
+                    raw={"id": "write-call"},
+                ),
+            ),
+            LLMResponse(content="done"),
+        ]
+        tool = ToolSpec(
+            "write_file",
+            "test write tool",
+            Risk("high", "test write", True),
+            lambda guard, path, content: "written",
+        )
+
+        result, calls = self._run_agent(responses=responses, tool=tool)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["response"], "done")
         self.assertTrue(any(event.type == "tool.finished" for event in result["events"]))
-
+        self.assertFalse(any(event.type == "approval.required" for event in result["events"]))
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,13 @@ async def execute_tool(name: str, arguments: dict[str, str], workspace: Path = W
             if not path.is_file():
                 return f"Not a file: {arguments.get('path', '')}"
             return path.read_text(encoding="utf-8")[:12000]
+        if name == "write_file":
+            content = arguments.get("content")
+            if content is None:
+                return "Tool error: content is required"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            return f"Wrote {path.relative_to(workspace)} ({len(content)} bytes)"
         if name == "grep_code":
             query = arguments.get("query", "")
             if not query:

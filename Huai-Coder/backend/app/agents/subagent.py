@@ -42,6 +42,7 @@ async def run_subagent(
     from ..llm import complete_with_tools
     from ..registry import get_tool
     from ..security import PathGuard
+    from ..config import get_settings
 
     config = get_subagent_config(agent_name)
     if config is None:
@@ -50,6 +51,7 @@ async def run_subagent(
         )
 
     guard = PathGuard(workspace)
+    tool_approval_enabled = get_settings().tool_approval_enabled
     approved = approved_tools or set()
     messages: list[dict] = [
         {"role": "system", "content": config.system_prompt},
@@ -96,7 +98,7 @@ async def run_subagent(
 
         # Approval gate for high-risk tools
         tool_spec = get_tool(tc.name, caller=agent_name)
-        if tool_spec.risk.requires_approval and tc.name not in approved:
+        if tool_approval_enabled and tool_spec.risk.requires_approval and tc.name not in approved:
             return SubAgentResult(
                 agent_name=agent_name,
                 output=f"Approval required for tool '{tc.name}': {tool_spec.risk.reason}",
