@@ -119,6 +119,12 @@ def _bound_react_messages(messages: list[dict], max_tokens: int) -> list[dict]:
     return compacted
 
 
+def _agent_token_budget(settings) -> int:
+    """Allow several context windows of ReAct work while keeping a hard cap."""
+    ratio = max(0.0, float(getattr(settings, "agent_token_budget_ratio", 4.0)))
+    return max(1, int(settings.context_max_tokens * ratio))
+
+
 def _workspace_context(root: Path) -> str:
     """Give the model a bounded, useful snapshot of the selected project."""
     files: list[str] = []
@@ -315,7 +321,7 @@ async def _execute(state: AgentState) -> AgentState:
     final_answer = ""
     repeated_call: tuple[str, str] | None = None
     repeated_count = 0
-    token_budget = max(1, settings.agent_token_budget)
+    token_budget = _agent_token_budget(settings)
     tokens_used = 0
     while True:
         messages = _bound_react_messages(messages, settings.context_max_tokens)

@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     memory_retention_days: int = 90
     context_compaction_enabled: bool = True
     context_max_tokens: int = 32768
-    agent_token_budget: int = 65536
+    agent_token_budget_ratio: float = 4.0
     tool_approval_enabled: bool = False
     context_compaction_threshold: float = 0.8
     context_recent_turns: int = 8

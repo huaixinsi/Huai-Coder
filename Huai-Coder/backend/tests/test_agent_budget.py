@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.agent import AgentEvent, _execute
+from app.agent import AgentEvent, _agent_token_budget, _execute
 from app.llm import LLMResponse, ParsedToolCall
 from app.registry import ToolSpec
 from app.security import Risk
@@ -25,7 +25,7 @@ class AgentBudgetTests(unittest.TestCase):
             calls.append(messages)
             return responses[len(calls) - 1]
 
-        settings = SimpleNamespace(context_max_tokens=100000, agent_token_budget=budget, tool_approval_enabled=False)
+        settings = SimpleNamespace(context_max_tokens=100000, agent_token_budget_ratio=budget / 100000, tool_approval_enabled=False)
         with tempfile.TemporaryDirectory() as temporary:
             state = {
                 "prompt": "test",
@@ -112,6 +112,11 @@ class AgentBudgetTests(unittest.TestCase):
         self.assertEqual(result["response"], "done")
         self.assertTrue(any(event.type == "tool.finished" for event in result["events"]))
         self.assertFalse(any(event.type == "approval.required" for event in result["events"]))
+
+    def test_budget_is_derived_from_context_ratio(self):
+        settings = SimpleNamespace(context_max_tokens=32768, agent_token_budget_ratio=4.0)
+
+        self.assertEqual(_agent_token_budget(settings), 131072)
 
 
 if __name__ == "__main__":
