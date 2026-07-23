@@ -239,6 +239,35 @@ class ConversationSummary(Base):
     )
 
 
+class BrowserSessionRecord(Base):
+    """Durable logical browser/MCP session state for refreshes and restarts."""
+
+    __tablename__ = "browser_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_key: Mapped[str] = mapped_column(String(100), unique=True)
+    server_id: Mapped[str] = mapped_column(String(64))
+    linked_session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    process_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    gateway_session_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="created")
+    current_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    persistent_profile: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class MemoryAudit(Base):
     __tablename__ = "memory_audits"
     id: Mapped[int] = mapped_column(primary_key=True)

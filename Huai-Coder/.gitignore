@@ -12,3 +12,13 @@ frontend/dist/
 *.log
 postgres_data/
 projects/
+.npm-cache/
+.playwright-browsers/
+.playwright-profiles/
+.localappdata/
+.playwright-mcp/
+.mcp-sdk-test-deps/
+.npm-cache*/
+.huai-coder-runtime/
+backend/mcp.json
+.pytest-*/

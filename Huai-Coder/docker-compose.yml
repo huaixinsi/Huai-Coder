@@ -22,8 +22,12 @@ services:
       DATABASE_URL: postgresql+asyncpg://huai_coder:${POSTGRES_PASSWORD}@db:5432/huai_coder_dev
       CORS_ORIGINS: http://localhost:5173,http://localhost
       WORKSPACE_ROOT: /workspace
+      MCP_CONFIG_PATH: ${MCP_CONFIG_PATH:-/workspace/backend/mcp.json}
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN:-}
     volumes:
       - ./:/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     depends_on:

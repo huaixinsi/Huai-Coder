@@ -1,6 +1,10 @@
 import asyncio
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import END, StateGraph
 
 from .base import SubAgentConfig
 from .registry import get_subagent_config
@@ -21,7 +25,75 @@ class SubAgentResult:
     pending_tool: ToolCall | None = None
 
 
-async def run_subagent(
+class _SubAgentGraphState(TypedDict, total=False):
+    """State passed through the LangGraph sub-agent boundary.
+
+    The runner keeps its own message history, so the parent Agent never shares
+    conversation messages with a child Agent.  Keeping the runner in graph
+    state also makes the boundary explicit for future per-turn streaming.
+    """
+
+    runner: Any
+    result: SubAgentResult | None
+
+
+class _SubAgentResourceLimiter:
+    """Process-wide concurrency and per-run quota for delegated Agents."""
+
+    def __init__(self, max_parallel: int, max_per_run: int, queue_timeout: float):
+        self.max_parallel = max(1, max_parallel)
+        self.max_per_run = max(1, max_per_run)
+        self.queue_timeout = max(0.1, queue_timeout)
+        self._semaphore = asyncio.Semaphore(self.max_parallel)
+        self._lock = asyncio.Lock()
+        self._active_by_run: dict[str, int] = {}
+
+    async def acquire(self, run_id: int | str | None) -> bool:
+        run_key = str(run_id) if run_id is not None else "anonymous"
+        try:
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=self.queue_timeout)
+        except asyncio.TimeoutError:
+            return False
+        async with self._lock:
+            active = self._active_by_run.get(run_key, 0)
+            if active >= self.max_per_run:
+                self._semaphore.release()
+                return False
+            self._active_by_run[run_key] = active + 1
+        return True
+
+    async def release(self, run_id: int | str | None) -> None:
+        run_key = str(run_id) if run_id is not None else "anonymous"
+        async with self._lock:
+            active = self._active_by_run.get(run_key, 0)
+            if active <= 1:
+                self._active_by_run.pop(run_key, None)
+            else:
+                self._active_by_run[run_key] = active - 1
+        self._semaphore.release()
+
+
+_resource_limiter: _SubAgentResourceLimiter | None = None
+_resource_limiter_key: tuple[int, int, float] | None = None
+
+
+def _get_resource_limiter() -> _SubAgentResourceLimiter:
+    from ..config import get_settings
+
+    global _resource_limiter, _resource_limiter_key
+    settings = get_settings()
+    key = (
+        max(1, int(getattr(settings, "subagent_max_parallel", 4))),
+        max(1, int(getattr(settings, "subagent_max_per_run", 4))),
+        max(0.1, float(getattr(settings, "subagent_queue_timeout_seconds", 5))),
+    )
+    if _resource_limiter is None or _resource_limiter_key != key:
+        _resource_limiter = _SubAgentResourceLimiter(*key)
+        _resource_limiter_key = key
+    return _resource_limiter
+
+
+async def _run_subagent_react(
     agent_name: str,
     task_prompt: str,
     workspace: str,
@@ -50,7 +122,7 @@ async def run_subagent(
             agent_name=agent_name, output=f"Unknown agent: {agent_name}", turns_used=0
         )
 
-    guard = PathGuard(workspace)
+    guard = PathGuard(Path(workspace))
     tool_approval_enabled = get_settings().tool_approval_enabled
     approved = approved_tools or set()
     messages: list[dict] = [
@@ -130,6 +202,57 @@ async def run_subagent(
         output=f"Reached max turns ({config.max_turns}) without completing.",
         turns_used=config.max_turns,
     )
+
+
+async def run_subagent(
+    agent_name: str,
+    task_prompt: str,
+    workspace: str,
+    approved_tools: set[str] | None = None,
+    run_id: int | str | None = None,
+) -> SubAgentResult:
+    """Run a permission-isolated child Agent inside a LangGraph subgraph.
+
+    The subgraph currently contains one ReAct node so the existing streaming
+    implementation remains compatible.  The explicit graph boundary gives
+    each child its own state and makes per-turn streaming/checkpointing a safe
+    follow-up.  A process-wide semaphore and per-run quota prevent a large
+    parent task from exhausting model or tool resources.
+    """
+
+    limiter = _get_resource_limiter()
+    if not await limiter.acquire(run_id):
+        return SubAgentResult(
+            agent_name=agent_name,
+            output=(
+                "SUBAGENT_RESOURCE_LIMIT: concurrent sub-agent capacity or "
+                "per-run quota has been reached; retry after an active task finishes."
+            ),
+            turns_used=0,
+        )
+
+    async def run_node(state: _SubAgentGraphState) -> dict[str, SubAgentResult]:
+        return {"result": await state["runner"]()}
+
+    graph = StateGraph(_SubAgentGraphState)
+    graph.add_node("react", run_node)
+    graph.set_entry_point("react")
+    graph.add_edge("react", END)
+    compiled = graph.compile()
+    try:
+        result_state = await compiled.ainvoke(
+            {
+                "runner": lambda: _run_subagent_react(
+                    agent_name=agent_name,
+                    task_prompt=task_prompt,
+                    workspace=workspace,
+                    approved_tools=approved_tools,
+                )
+            }
+        )
+        return result_state["result"]
+    finally:
+        await limiter.release(run_id)
 
 
 def _build_tool_schemas(config: SubAgentConfig) -> list[dict]:

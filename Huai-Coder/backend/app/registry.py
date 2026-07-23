@@ -64,7 +64,8 @@ def _write_file(path: str, content: str, guard: PathGuard) -> str:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    return f"Wrote {target.relative_to(guard.root)} ({len(content)} bytes)"
+    relative = str(target.relative_to(guard.root)).replace("\\", "/")
+    return f"Wrote {relative} ({len(content)} bytes)"
 
 
 async def _execute_command(command: str, guard: PathGuard) -> str:
@@ -85,12 +86,20 @@ async def _execute_command(command: str, guard: PathGuard) -> str:
     return f"exit_code={process.returncode}\n{output}"
 
 
-async def _spawn_subagent(agent_name: str, task: str, guard: PathGuard) -> str:
+async def _spawn_subagent(
+    agent_name: str,
+    task: str,
+    guard: PathGuard,
+    run_id: int | None = None,
+) -> str:
     """Spawn a sub-agent to handle a delegated task."""
     from .agents.subagent import run_subagent
 
     result = await run_subagent(
-        agent_name=agent_name, task_prompt=task, workspace=str(guard.root)
+        agent_name=agent_name,
+        task_prompt=task,
+        workspace=str(guard.root),
+        run_id=run_id,
     )
     if result.approval_required and result.pending_tool:
         return f"APPROVAL_REQUIRED: Agent '{agent_name}' needs approval for '{result.pending_tool.name}'. {result.output}"

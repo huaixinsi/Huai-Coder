@@ -1,14 +1,16 @@
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import Settings
 from app.context import ContextManager, estimate_tokens
 from app.database import Base
 from app.agent import _bound_react_messages
-from app.memory import GLOBAL_MEMORY_SCOPE_ID, MemoryService, extract_candidates
-from app.models import Memory, Message, Project, Session
+from app.main import MemoryCreateRequest, MemoryPatchRequest, create_memory, delete_memory, list_memory_audit, list_project_memory_audit, update_memory
+from app.memory import GLOBAL_MEMORY_SCOPE_ID, MemoryCandidate, MemoryService, extract_candidates
+from app.models import Memory, MemoryAudit, Message, Project, Session
 
 
 @pytest.fixture
@@ -76,6 +78,120 @@ async def test_memory_upsert_deduplicates_and_searches(db_session):
     found = await service.search(db_session, project_id=1, query="PostgreSQL 主库")
     assert len(found) == 1
     assert found[0].access_count == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_delete_keeps_auditable_history(db_session):
+    service = MemoryService()
+    memory = await service.upsert(
+        db_session,
+        MemoryCandidate(
+            scope_type="project",
+            scope_id=3,
+            memory_type="fact",
+            content="Python backend",
+            importance=5,
+            confidence=0.9,
+        ),
+        reason="test create",
+    )
+    await db_session.commit()
+    await service.delete(db_session, memory)
+    await db_session.commit()
+
+    audits = list(
+        (
+            await db_session.scalars(
+                select(MemoryAudit).where(MemoryAudit.memory_id == memory.id)
+            )
+        ).all()
+    )
+    assert [audit.action for audit in audits] == ["create", "delete"]
+    assert memory.status == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_memory_audit_routes_return_single_and_project_history(db_session):
+    project = Project(name="audit-route-project")
+    db_session.add(project)
+    await db_session.flush()
+    service = MemoryService()
+    memory = await service.upsert(
+        db_session,
+        MemoryCandidate(
+            scope_type="project",
+            scope_id=project.id,
+            memory_type="fact",
+            content="Audit route memory",
+            importance=5,
+            confidence=0.9,
+        ),
+    )
+    await db_session.commit()
+
+    single = await list_memory_audit(memory.id, db_session)
+    project_history = await list_project_memory_audit(project.id, False, db_session)
+    assert single[0]["memory_id"] == memory.id
+    assert project_history[0]["action"] == "create"
+
+
+@pytest.mark.asyncio
+async def test_memory_update_and_delete_routes_keep_audit_history(db_session):
+    service = MemoryService()
+    memory = await service.upsert(
+        db_session,
+        MemoryCandidate(
+            scope_type="project",
+            scope_id=8,
+            memory_type="fact",
+            content="Original project fact",
+            importance=5,
+            confidence=0.9,
+        ),
+        reason="route test create",
+    )
+    await db_session.commit()
+
+    updated = await update_memory(
+        memory.id,
+        MemoryPatchRequest(content="Updated project fact"),
+        db_session,
+    )
+    assert updated["content"] == "Updated project fact"
+    await delete_memory(memory.id, db_session)
+    await db_session.refresh(memory)
+
+    assert memory.status == "deleted"
+    audits = list(
+        (
+            await db_session.scalars(
+                select(MemoryAudit)
+                .where(MemoryAudit.memory_id == memory.id)
+                .order_by(MemoryAudit.id)
+            )
+        ).all()
+    )
+    assert [audit.action for audit in audits] == ["create", "update", "delete"]
+    assert audits[1].before_content == "Original project fact"
+    assert audits[1].after_content == "Updated project fact"
+
+
+@pytest.mark.asyncio
+async def test_memory_create_route_supports_global_user_scope(db_session):
+    project = Project(name="user-memory-route-project")
+    db_session.add(project)
+    await db_session.flush()
+    payload = await create_memory(
+        MemoryCreateRequest(
+            project_id=project.id,
+            scope_type="user",
+            memory_type="preference",
+            content="用户偏好中文回复",
+        ),
+        db_session,
+    )
+    assert payload["scope_type"] == "user"
+    assert payload["scope_id"] == GLOBAL_MEMORY_SCOPE_ID
 
 
 @pytest.mark.asyncio

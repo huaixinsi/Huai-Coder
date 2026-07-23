@@ -20,6 +20,10 @@ type PlanTask = { id: number; task_key: string; title: string; description: stri
 type Project = { id: number; name: string; description?: string };
 type ChatSession = { id: number; project_id: number; title: string };
 type Memory = { id: number; memory_type: string; content: string; importance: number; confidence: number; status: string; source_session_id?: number; expires_at?: string };
+type MemoryOverview = { session: Memory[]; project: Memory[]; user: Memory[] };
+type MemoryAudit = { id: number; memory_id: number; action: string; before_content?: string | null; after_content?: string | null; reason: string; created_at?: string };
+type SubAgent = { name: string; description: string; tools: string[]; needs_approval: boolean };
+type SubAgentCatalog = { graph: { type: string; root: string; child: string; edges: string[] }; agents: SubAgent[] };
 type Activity = { type: string; tool?: string; arguments?: string; content?: string; status: "running" | "done" | "info" | "error" };
 type ChatMessage = { id: string; role: "user" | "assistant" | "system"; content: string; activities: Activity[]; status?: "running" | "done" | "failed" };
 type Approval = StreamEvent;
@@ -27,6 +31,8 @@ type DirectoryFile = { file: File; relativePath: string };
 type ClientToolCall = { invocation_id: string; tool: string; arguments: Record<string, unknown>; execution: "client" };
 type ClientToolResult = { ok: boolean; result?: string; error_type?: string; changed_paths?: string[]; content_hash?: string };
 type WorkspaceStatus = { bound: boolean; file_count: number; folder_name?: string | null };
+type McpTool = { name: string; original_name: string; description?: string; risk_level: string; risk_reason?: string; requires_approval: boolean };
+type McpServer = { id: string; status: string; enabled: boolean; transport: string; tool_count: number; error?: string | null; tools?: McpTool[] };
 type RunStatus = "idle" | "running" | "waiting" | "completed" | "failed" | "limited" | "stopped";
 
 declare global {
@@ -43,7 +49,7 @@ function Markdown({ value }: { value: string }) {
 
 function ActivityList({ activities }: { activities: Activity[] }) {
   if (!activities.length) return null;
-  const toolCalls = activities.filter(activity => activity.type === "tool");
+  const toolCalls = activities.filter(activity => activity.type === "tool" || activity.type === "agent");
   const finished = toolCalls.filter(activity => activity.status !== "running").length;
   const formatArguments = (value?: string) => {
     if (!value) return "";
@@ -61,10 +67,69 @@ function ActivityList({ activities }: { activities: Activity[] }) {
   </details>;
 }
 
+function McpDock({
+  servers,
+  busy,
+  error,
+  onRefresh,
+  onConnect,
+  onDisconnect,
+  onReconnect,
+  expandedServer,
+  toolCache,
+  onToggleTools,
+}: {
+  servers: McpServer[];
+  busy: boolean;
+  error: string;
+  onRefresh: () => void;
+  onConnect: (id: string) => void;
+  onDisconnect: (id: string) => void;
+  onReconnect: (id: string) => void;
+  expandedServer: string | null;
+  toolCache: Record<string, McpTool[]>;
+  onToggleTools: (id: string) => void;
+}) {
+  return <aside className="mcp-dock panel" aria-label="MCP 服务">
+    <div className="section-heading"><div><h3>MCP 工具</h3><p>浏览器、GitHub 等外部能力</p></div><button type="button" className="secondary-button" onClick={onRefresh} disabled={busy}>刷新</button></div>
+    {servers.length === 0 ? <p className="muted">未配置 MCP Server。复制 backend/mcp.example.json 后设置 MCP_CONFIG_PATH。</p> : <ul className="mcp-list">{servers.map(server => <li key={server.id}><div className="mcp-server-main"><div className="mcp-server-row"><strong>{server.id}</strong><span className={`mcp-status ${server.status}`}>{server.status}</span></div><small>{server.transport} · {server.tool_count} 个工具</small>{server.error && <span className="folder-error">{server.error}</span>}{(server.status === "ready" || server.tool_count > 0) && <button type="button" className="mcp-tools-toggle" onClick={() => onToggleTools(server.id)}>{expandedServer === server.id ? "收起工具" : "查看工具"}</button>}{expandedServer === server.id && <ul className="mcp-tool-list">{(toolCache[server.id] ?? server.tools ?? []).length === 0 ? <li className="muted">暂无已发现工具</li> : (toolCache[server.id] ?? server.tools ?? []).map(tool => <li key={tool.name}><strong>{tool.original_name}</strong><small>{tool.risk_level}{tool.requires_approval ? " · 需要审批" : " · 可直接调用"}</small>{tool.description && <span>{tool.description}</span>}</li>)}</ul>}</div>{server.status === "ready" ? <div className="mcp-actions"><button type="button" className="secondary-button" onClick={() => onReconnect(server.id)} disabled={busy}>重连</button><button type="button" className="delete-button" onClick={() => onDisconnect(server.id)} disabled={busy}>断开</button></div> : <button type="button" className="delete-button" onClick={() => onConnect(server.id)} disabled={busy || !server.enabled}>连接</button>}</li>)}</ul>}
+    {error && <p className="folder-error">{error}</p>}
+  </aside>;
+}
+
+function SubAgentDock({ catalog }: { catalog: SubAgentCatalog | null }) {
+  if (!catalog) return null;
+  return <aside className="subagent-dock panel" aria-label="SubAgent 拓扑和权限">
+    <div className="section-heading"><div><h3>SubAgent 拓扑</h3><p>{catalog.graph.root} → {catalog.graph.child}，运行详情显示在对话执行流中</p></div><span className="status-pill">{catalog.agents.length} 个角色</span></div>
+    <div className="subagent-graph">{catalog.graph.edges.map(edge => <span key={edge}>{edge}</span>)}</div>
+    <ul className="subagent-list">{catalog.agents.map(agent => <li key={agent.name}><div><strong>{agent.name}</strong><small>{agent.description}</small><small>工具：{agent.tools.join("、")} · {agent.needs_approval ? "需要审批" : "只读"}</small></div></li>)}</ul>
+  </aside>;
+}
+
+function MemoryOverviewPanel({
+  overview,
+  audits,
+  selectedAuditMemoryId,
+  onAudit,
+  onEdit,
+  onDelete,
+}: {
+  overview: MemoryOverview;
+  audits: MemoryAudit[];
+  selectedAuditMemoryId: number | null;
+  onAudit: (memoryId: number) => void;
+  onEdit: (memory: Memory) => void;
+  onDelete: (memoryId: number) => void;
+}) {
+  const groups: Array<[string, Memory[]]> = [["当前会话", overview.session], ["当前项目", overview.project], ["用户记忆", overview.user]];
+  return <section className="memory-overview panel"><div className="section-heading"><div><h2>记忆分层与审计</h2><p>会话记忆 → 项目记忆 → 用户记忆；删除操作只做软删除并保留审计记录。</p></div></div><div className="memory-scope-grid">{groups.map(([label, items]) => <article key={label}><h3>{label}<span>{items.length}</span></h3>{items.length === 0 ? <p className="muted">暂无</p> : <ul className="memory-list">{items.map(memory => <li key={memory.id}><span><small>{memory.memory_type} · 重要性 {memory.importance}</small>{memory.content}</span><div className="memory-actions"><button type="button" className="secondary-button" onClick={() => onAudit(memory.id)}>审计</button><button type="button" className="secondary-button" onClick={() => onEdit(memory)}>编辑</button><button type="button" className="delete-button" onClick={() => onDelete(memory.id)}>删除</button></div></li>)}</ul>}</article>)}</div>{selectedAuditMemoryId !== null && <div className="memory-audit"><h3>记忆 #{selectedAuditMemoryId} 的变更记录</h3>{audits.length === 0 ? <p className="muted">暂无审计记录</p> : <ul>{audits.map(audit => <li key={audit.id}><strong>{audit.action}</strong><span>{audit.reason}</span><small>{audit.created_at ?? ""}</small>{audit.after_content && <pre>{audit.after_content}</pre>}</li>)}</ul>}</div>}</section>;
+}
+
 function App() {
   const [prompt, setPrompt] = useState("");
   const [running, setRunning] = useState(false);
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
+  const [activeRunId, setActiveRunId] = useState<number | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectName, setProjectName] = useState("");
   const [selectedProject, setSelectedProject] = useState<number | null>(null);
@@ -88,16 +153,128 @@ function App() {
   const [planTasks, setPlanTasks] = useState<PlanTask[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [memories, setMemories] = useState<Memory[]>([]);
+  const [memoryOverview, setMemoryOverview] = useState<MemoryOverview>({ session: [], project: [], user: [] });
+  const [memoryAudits, setMemoryAudits] = useState<MemoryAudit[]>([]);
+  const [selectedAuditMemoryId, setSelectedAuditMemoryId] = useState<number | null>(null);
   const [memoryContent, setMemoryContent] = useState("");
+  const [memoryScope, setMemoryScope] = useState<"project" | "session" | "user">("project");
   const [memoryType, setMemoryType] = useState("fact");
   const [memoryBusy, setMemoryBusy] = useState(false);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
+  const [mcpBusy, setMcpBusy] = useState(false);
+  const [mcpError, setMcpError] = useState("");
+  const [expandedMcpServer, setExpandedMcpServer] = useState<string | null>(null);
+  const [mcpToolCache, setMcpToolCache] = useState<Record<string, McpTool[]>>({});
+  const [subagentCatalog, setSubagentCatalog] = useState<SubAgentCatalog | null>(null);
 
   useEffect(() => { fetch(`${API}/api/projects`).then(r => r.ok ? r.json() : []).then(setProjects).catch(() => undefined); }, []);
+  useEffect(() => { void loadMcpServers(); }, []);
+  useEffect(() => { fetch(`${API}/api/subagents`).then(r => r.ok ? r.json() : null).then(setSubagentCatalog).catch(() => undefined); }, []);
   useEffect(() => { if (plan) fetch(`${API}/api/plans/${plan.id}/tasks`).then(r => r.ok ? r.json() : []).then(setPlanTasks).catch(() => undefined); }, [plan?.id]);
 
+  async function loadMcpServers() {
+    try {
+      const response = await fetch(`${API}/api/mcp/servers`);
+      if (!response.ok) throw new Error(`MCP 服务读取失败 (${response.status})`);
+      const payload = await response.json() as { servers?: McpServer[] };
+      setMcpServers(payload.servers ?? []);
+      setMcpError("");
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : "MCP 服务读取失败");
+    }
+  }
+
+  async function connectMcpServer(serverId: string) {
+    if (mcpBusy) return;
+    setMcpBusy(true); setMcpError("");
+    try {
+      const response = await fetch(`${API}/api/mcp/servers/${encodeURIComponent(serverId)}/connect`, { method: "POST" });
+      const payload = await response.json().catch(() => ({})) as { detail?: string };
+      if (!response.ok) throw new Error(payload.detail || `MCP 连接失败 (${response.status})`);
+      await loadMcpServers();
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : "MCP 连接失败");
+    } finally { setMcpBusy(false); }
+  }
+
+  async function disconnectMcpServer(serverId: string) {
+    if (mcpBusy) return;
+    setMcpBusy(true); setMcpError("");
+    try {
+      const response = await fetch(`${API}/api/mcp/servers/${encodeURIComponent(serverId)}/disconnect`, { method: "POST" });
+      if (!response.ok) throw new Error(`MCP 断开失败 (${response.status})`);
+      await loadMcpServers();
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : "MCP 断开失败");
+    } finally { setMcpBusy(false); }
+  }
+
+  async function reconnectMcpServer(serverId: string) {
+    if (mcpBusy) return;
+    setMcpBusy(true); setMcpError("");
+    try {
+      const response = await fetch(`${API}/api/mcp/servers/${encodeURIComponent(serverId)}/reconnect`, { method: "POST" });
+      const payload = await response.json().catch(() => ({})) as { detail?: string };
+      if (!response.ok) throw new Error(payload.detail || `MCP 重连失败 (${response.status})`);
+      setMcpToolCache(current => ({ ...current, [serverId]: [] }));
+      await loadMcpServers();
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : "MCP 重连失败");
+    } finally { setMcpBusy(false); }
+  }
+
+  async function refreshMcpServers() {
+    if (mcpBusy) return;
+    setMcpBusy(true); setMcpError("");
+    try {
+      const response = await fetch(`${API}/api/mcp/refresh`, { method: "POST" });
+      const payload = await response.json().catch(() => ({})) as { detail?: string };
+      if (!response.ok) throw new Error(payload.detail || `MCP 刷新失败 (${response.status})`);
+      await loadMcpServers();
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : "MCP 刷新失败");
+    } finally { setMcpBusy(false); }
+  }
+
+  async function toggleMcpTools(serverId: string) {
+    if (expandedMcpServer === serverId) {
+      setExpandedMcpServer(null);
+      return;
+    }
+    setExpandedMcpServer(serverId);
+    if (mcpToolCache[serverId]) return;
+    try {
+      const response = await fetch(`${API}/api/mcp/servers/${encodeURIComponent(serverId)}/tools`);
+      if (!response.ok) throw new Error(`工具列表读取失败 (${response.status})`);
+      const payload = await response.json() as { tools?: McpTool[] };
+      setMcpToolCache(current => ({ ...current, [serverId]: payload.tools ?? [] }));
+    } catch (error) {
+      setMcpError(error instanceof Error ? error.message : "工具列表读取失败");
+    }
+  }
+
   async function loadMemories(projectId: number) {
-    const r = await fetch(`${API}/api/projects/${projectId}/memories`);
-    if (r.ok) setMemories(await r.json());
+    const r = await fetch(`${API}/api/projects/${projectId}/memories/overview`);
+    if (!r.ok) return;
+    const payload = await r.json() as { project?: Memory[]; global?: Memory[] };
+    const nextOverview = { session: [], project: payload.project ?? [], user: payload.global ?? [] };
+    setMemoryOverview(nextOverview);
+    setMemories(nextOverview.project);
+  }
+
+  async function loadSessionMemoryOverview(sessionId: number) {
+    const r = await fetch(`${API}/api/sessions/${sessionId}/memories/overview`);
+    if (!r.ok) return;
+    const payload = await r.json() as MemoryOverview;
+    setMemoryOverview({ session: payload.session ?? [], project: payload.project ?? [], user: payload.user ?? [] });
+    setMemories(payload.project ?? []);
+  }
+
+  async function loadMemoryAudit(memoryId: number) {
+    const r = await fetch(`${API}/api/memories/${memoryId}/audit`);
+    if (!r.ok) return;
+    setSelectedAuditMemoryId(memoryId);
+    setMemoryAudits(await r.json() as MemoryAudit[]);
   }
 
   async function selectProject(id: number) {
@@ -120,6 +297,7 @@ function App() {
 
   async function selectSession(id: number) {
     setSelectedSession(id); setRunStatus("idle");
+    void loadSessionMemoryOverview(id);
     const r = await fetch(`${API}/api/sessions/${id}/messages`);
     if (!r.ok) return;
     const messages = await r.json();
@@ -157,15 +335,46 @@ function App() {
     if (!selectedProject || !memoryContent.trim() || memoryBusy) return;
     setMemoryBusy(true);
     try {
-      const r = await fetch(`${API}/api/memories`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project_id: selectedProject, scope_type: "project", memory_type: memoryType, content: memoryContent.trim(), importance: 5, confidence: 0.9 }) });
-      if (r.ok) { setMemoryContent(""); await loadMemories(selectedProject); }
+      const r = await fetch(`${API}/api/memories`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project_id: selectedProject, session_id: memoryScope === "session" ? selectedSession : null, scope_type: memoryScope, memory_type: memoryType, content: memoryContent.trim(), importance: 5, confidence: 0.9 }) });
+      if (r.ok) { setMemoryContent(""); await reloadMemoryView(); }
+    } finally { setMemoryBusy(false); }
+  }
+
+  async function reloadMemoryView() {
+    if (selectedSession) {
+      await loadSessionMemoryOverview(selectedSession);
+    } else if (selectedProject) {
+      await loadMemories(selectedProject);
+    }
+  }
+
+  async function editMemory(memory: Memory) {
+    const nextContent = window.prompt("修改长期记忆", memory.content)?.trim();
+    if (!nextContent || nextContent === memory.content || memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const r = await fetch(`${API}/api/memories/${memory.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: nextContent }) });
+      if (!r.ok) {
+        const payload = await r.json().catch(() => ({})) as { detail?: string };
+        throw new Error(payload.detail || `记忆修改失败 (${r.status})`);
+      }
+      await reloadMemoryView();
+      await loadMemoryAudit(memory.id);
+    } catch (error) {
+      setFolderError(error instanceof Error ? error.message : "记忆修改失败");
     } finally { setMemoryBusy(false); }
   }
 
   async function removeMemory(id: number) {
-    if (!selectedProject || !window.confirm("删除这条长期记忆？")) return;
-    const r = await fetch(`${API}/api/memories/${id}`, { method: "DELETE" });
-    if (r.ok) await loadMemories(selectedProject);
+    if (!window.confirm("删除这条长期记忆？删除后仍会保留审计记录。") || memoryBusy) return;
+    setMemoryBusy(true);
+    try {
+      const r = await fetch(`${API}/api/memories/${id}`, { method: "DELETE" });
+      if (!r.ok) throw new Error(`记忆删除失败 (${r.status})`);
+      await reloadMemoryView();
+    } catch (error) {
+      setFolderError(error instanceof Error ? error.message : "记忆删除失败");
+    } finally { setMemoryBusy(false); }
   }
 
   async function compactSelectedSession() {
@@ -182,12 +391,47 @@ function App() {
   const updateMessage = (id: string, updater: (message: ChatMessage) => ChatMessage) => setChatMessages(current => current.map(message => message.id === id ? updater(message) : message));
 
   function handleStreamEvent(item: StreamEvent, assistantId: string) {
+    if (item.run_id) setActiveRunId(item.run_id);
     if (item.type === "message.delta") {
       updateMessage(assistantId, message => ({ ...message, content: message.content + (item.content ?? "") }));
       return;
     }
     if (item.type === "context.compacted") {
       updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: item.type, content: item.content, status: "info" }] }));
+      return;
+    }
+    if (item.type === "mcp.server.starting" || item.type === "mcp.server.ready" || item.type === "mcp.server.stopped" || item.type === "mcp.tools.discovered" || item.type === "mcp.session.created" || item.type === "mcp.session.closed") {
+      updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: "context.compacted", content: `MCP：${item.type}${item.content ? ` · ${item.content}` : ""}`, status: "info" }] }));
+      return;
+    }
+    if (item.type === "mcp.server.failed" || item.type === "mcp.registry.failed") {
+      updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: "context.compacted", content: `MCP：${item.content ?? "连接失败"}`, status: "error" }] }));
+      return;
+    }
+    if (item.type === "mcp.tool.completed" || item.type === "mcp.tool.failed" || item.type === "mcp.tool.rejected") {
+      const status = item.type === "mcp.tool.completed" ? "done" : "error";
+      updateMessage(assistantId, message => {
+        const activities = [...message.activities];
+        const index = [...activities].reverse().findIndex(activity => activity.type === "tool" && activity.tool === item.tool && activity.status === "running");
+        const target = index < 0 ? -1 : activities.length - 1 - index;
+        if (target >= 0) activities[target] = { ...activities[target], content: item.content, status };
+        return { ...message, activities };
+      });
+      return;
+    }
+    if (item.type === "agent.started") {
+      updateMessage(assistantId, message => ({ ...message, activities: [...message.activities, { type: "agent", tool: item.tool, arguments: item.content, status: "running" }] }));
+      return;
+    }
+    if (item.type === "agent.finished" || item.type === "agent.failed") {
+      const status = item.type === "agent.finished" ? "done" : "error";
+      updateMessage(assistantId, message => {
+        const activities = [...message.activities];
+        const index = [...activities].reverse().findIndex(activity => activity.type === "agent" && activity.tool === item.tool && activity.status === "running");
+        const target = index < 0 ? -1 : activities.length - 1 - index;
+        if (target >= 0) activities[target] = { ...activities[target], content: item.content, status };
+        return { ...message, activities };
+      });
       return;
     }
     if (item.type === "tool.request") {
@@ -222,7 +466,12 @@ function App() {
         const index = [...activities].reverse().findIndex(activity => activity.type === "tool" && activity.tool === item.tool && activity.status === "running");
         const target = index < 0 ? -1 : activities.length - 1 - index;
         if (target >= 0) activities[target] = { ...activities[target], content: item.content, status: "done" };
-        else activities.push({ type: "tool", tool: item.tool, content: item.content, status: "done" });
+        else {
+          const existing = [...activities].reverse().findIndex(activity => activity.type === "tool" && activity.tool === item.tool);
+          const existingIndex = existing < 0 ? -1 : activities.length - 1 - existing;
+          if (existingIndex >= 0) activities[existingIndex] = { ...activities[existingIndex], content: item.content, status: "done" };
+          else activities.push({ type: "tool", tool: item.tool, content: item.content, status: "done" });
+        }
         return { ...message, activities };
       });
       return;
@@ -248,16 +497,25 @@ function App() {
     if (item.type === "run.finished") {
       updateMessage(assistantId, message => ({ ...message, status: "done" }));
       setRunStatus(current => current === "waiting" ? current : "completed");
+      setActiveRunId(null);
       return;
     }
     if (item.type === "run.limited") {
       updateMessage(assistantId, message => ({ ...message, status: "failed", content: message.content || item.content || "本轮已达到最大执行轮次，任务尚未完成。" }));
       setRunStatus("limited");
+      setActiveRunId(null);
       return;
     }
     if (item.type === "run.failed") {
       updateMessage(assistantId, message => ({ ...message, status: "failed", content: message.content || item.content || "本次运行失败，请查看执行过程。" }));
       setRunStatus("failed");
+      setActiveRunId(null);
+      return;
+    }
+    if (item.type === "run.cancelled") {
+      updateMessage(assistantId, message => ({ ...message, status: "failed", content: message.content || item.content || "任务已取消。" }));
+      setRunStatus("stopped");
+      setActiveRunId(null);
       return;
     }
     if (item.type === "plan.created" && item.plan_id) { setPlan({ id: item.plan_id, summary: item.content, status: "WAITING_CONFIRMATION" }); return; }
@@ -304,6 +562,17 @@ function App() {
     } finally {
       await localWriteQueueRef.current;
       setRunning(false);
+    }
+  }
+
+  async function cancelRun() {
+    if (!activeRunId) return;
+    try {
+      const response = await fetch(`${API}/api/runs/${activeRunId}/cancel`, { method: "POST" });
+      if (!response.ok) throw new Error(`取消任务失败 (${response.status})`);
+      setRunStatus("stopped");
+    } catch (error) {
+      setFolderError(error instanceof Error ? error.message : "取消任务失败");
     }
   }
 
@@ -648,10 +917,13 @@ function App() {
       </div>
       <div className="hero-art" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="hero-mascot">麻</span><span className="hero-star star-one">✦</span><span className="hero-star star-two">✧</span></div>
     </section>
-    <section className="projects panel"><h2>项目与会话</h2><div className="project-create"><input value={projectName} onChange={event => setProjectName(event.target.value)} placeholder="新建项目" /><button onClick={createProject}>创建</button></div><ul className="project-list">{projects.map(project => <li key={project.id} className={selectedProject === project.id ? "selected" : ""} onClick={() => selectProject(project.id)}><span>{project.name}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteProject(project.id); }}>删除</button></li>)}</ul>{selectedProject && <div className="project-tools"><div className="session-create"><input value={sessionTitle} onChange={event => setSessionTitle(event.target.value)} placeholder="新会话名称" /><button onClick={createSession}>新建会话</button></div><ul className="session-list">{sessions.map(session => <li key={session.id} className={selectedSession === session.id ? "selected" : ""} onClick={() => selectSession(session.id)}><span>{session.title}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteSession(session.id); }}>删除</button></li>)}</ul><div className="folder-area"><button type="button" className="secondary-button" onClick={chooseFolder} disabled={uploading}>{uploading ? "上传中…" : "绑定/切换文件夹"}</button><label className="secondary-button">选择文件<input type="file" multiple onChange={uploadFiles} disabled={uploading} /></label>{folderName && <span className="folder-name">当前绑定：{folderName}</span>}{!folderBound && <span className="folder-reminder">请先绑定对应文件夹</span>}{folderBound && !folderWritable && <span className="folder-reminder">请重新选择可写文件夹以同步代码</span>}{folderSyncMessage && <span className="folder-sync">{folderSyncMessage}</span>}{folderError && <span className="folder-error">{folderError}</span>}</div><div className="memory-panel"><div className="section-heading"><div><h3>长期记忆</h3><p>只保存可复用的项目事实、决策和约束</p></div><button className="secondary-button" type="button" onClick={compactSelectedSession} disabled={!selectedSession || memoryBusy}>压缩会话</button></div><div className="memory-create"><select value={memoryType} onChange={event => setMemoryType(event.target.value)}><option value="fact">事实</option><option value="decision">决策</option><option value="preference">偏好</option><option value="constraint">约束</option><option value="task">待办</option></select><input value={memoryContent} onChange={event => setMemoryContent(event.target.value)} placeholder="保存一条项目记忆" /><button type="button" onClick={createMemory} disabled={memoryBusy || !memoryContent.trim()}>保存</button></div><ul className="memory-list">{memories.length === 0 ? <li className="muted">暂无项目记忆</li> : memories.map(memory => <li key={memory.id}><span><small>{memory.memory_type} · 重要性 {memory.importance}</small>{memory.content}</span><button type="button" className="delete-button" onClick={() => removeMemory(memory.id)}>删除</button></li>)}</ul></div></div>}</section>
+    <section className="projects panel"><h2>项目与会话</h2><div className="project-create"><input value={projectName} onChange={event => setProjectName(event.target.value)} placeholder="新建项目" /><button onClick={createProject}>创建</button></div><ul className="project-list">{projects.map(project => <li key={project.id} className={selectedProject === project.id ? "selected" : ""} onClick={() => selectProject(project.id)}><span>{project.name}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteProject(project.id); }}>删除</button></li>)}</ul>{selectedProject && <div className="project-tools"><div className="session-create"><input value={sessionTitle} onChange={event => setSessionTitle(event.target.value)} placeholder="新会话名称" /><button onClick={createSession}>新建会话</button></div><ul className="session-list">{sessions.map(session => <li key={session.id} className={selectedSession === session.id ? "selected" : ""} onClick={() => selectSession(session.id)}><span>{session.title}</span><button className="delete-button" onClick={event => { event.stopPropagation(); deleteSession(session.id); }}>删除</button></li>)}</ul><div className="folder-area"><button type="button" className="secondary-button" onClick={chooseFolder} disabled={uploading}>{uploading ? "上传中…" : "绑定/切换文件夹"}</button><label className="secondary-button">选择文件<input type="file" multiple onChange={uploadFiles} disabled={uploading} /></label>{folderName && <span className="folder-name">当前绑定：{folderName}</span>}{!folderBound && <span className="folder-reminder">请先绑定对应文件夹</span>}{folderBound && !folderWritable && <span className="folder-reminder">请重新选择可写文件夹以同步代码</span>}{folderSyncMessage && <span className="folder-sync">{folderSyncMessage}</span>}{folderError && <span className="folder-error">{folderError}</span>}</div><div className="memory-panel"><div className="section-heading"><div><h3>长期记忆</h3><p>只保存可复用的项目事实、决策和约束</p></div><button className="secondary-button" type="button" onClick={compactSelectedSession} disabled={!selectedSession || memoryBusy}>压缩会话</button></div><div className="memory-create"><select value={memoryScope} onChange={event => setMemoryScope(event.target.value as "project" | "session" | "user")}><option value="project">项目记忆</option><option value="session" disabled={!selectedSession}>会话记忆</option><option value="user">用户记忆</option></select><select value={memoryType} onChange={event => setMemoryType(event.target.value)}><option value="fact">事实</option><option value="decision">决策</option><option value="preference">偏好</option><option value="constraint">约束</option><option value="task">待办</option></select><input value={memoryContent} onChange={event => setMemoryContent(event.target.value)} placeholder={`保存一条${memoryScope === "user" ? "用户" : memoryScope === "session" ? "会话" : "项目"}记忆`} /><button type="button" onClick={createMemory} disabled={memoryBusy || !memoryContent.trim() || (memoryScope === "session" && !selectedSession)}>保存</button></div><ul className="memory-list">{memories.length === 0 ? <li className="muted">暂无项目记忆</li> : memories.map(memory => <li key={memory.id}><span><small>{memory.memory_type} · 重要性 {memory.importance}</small>{memory.content}</span><button type="button" className="delete-button" onClick={() => removeMemory(memory.id)}>删除</button></li>)}</ul></div></div>}</section>
     {plan && <section className="plan-panel panel"><div className="section-heading"><div><h2>执行计划</h2><p>{plan.goal}</p></div><span className="status-pill">{plan.status}</span></div><p>{plan.summary}</p><div className="plan-tasks">{planTasks.length === 0 ? <p className="muted">正在加载任务列表…</p> : planTasks.map((task, index) => <article key={task.id}><strong>{index + 1}. {task.title}</strong><small>{task.task_key} · {task.task_type} · {task.status} · 重试 {task.retry_count}/2</small><div>{task.description}</div>{task.output_data && <pre>{task.output_data}</pre>}{task.error_message && <pre>{task.error_message}</pre>}</article>)}</div><div className="action-row"><button onClick={() => planAction("confirm")} disabled={plan.status !== "WAITING_CONFIRMATION"}>确认计划</button><button onClick={() => planAction("cancel")} disabled={plan.status === "SUCCEEDED" || plan.status === "CANCELLED"}>取消计划</button><button onClick={() => planAction("pause")} disabled={plan.status !== "RUNNING"}>暂停</button><button onClick={() => planAction("resume")} disabled={plan.status !== "PAUSED"}>继续</button></div></section>}
-    <section className="chat panel"><div className="chat-heading"><div><h2>对话</h2><p>{folderBound && folderWritable ? `当前会话工作区：${folderName || "已绑定"}` : folderBound ? "请重新选择可写文件夹，代码才能同步回本地。" : "每次对话前，请先绑定当前项目对应的文件夹。"}</p></div><button type="button" className={`run-status ${statusView.kind}`} aria-live="polite" disabled><span className="run-status-icon" aria-hidden="true" />{statusView.label}</button></div><div className="timeline">{chatMessages.length === 0 && <p className="empty">选择项目和会话后，开始向 Agent 提问。</p>}{chatMessages.map(message => <article className={`chat-message ${message.role} ${message.status ?? ""}`} key={message.id}><div className="message-head"><span className="role-label">{message.role === "user" ? "你" : message.role === "assistant" ? "Huai-Coder" : "系统"}</span>{message.role === "assistant" && message.content && <button className="copy-button" onClick={() => copyMessage(message.content)}>复制</button>}</div><ActivityList activities={message.activities} />{message.content ? <div className="message-content"><Markdown value={message.content} /></div> : message.status === "running" && <div className="typing"><i /><i /><i />正在思考…</div>}{message.status === "failed" && <div className="message-error">本次运行未完成，可以继续发送指令。</div>}</article>)}</div><form onSubmit={submit}><input value={prompt} onChange={event => setPrompt(event.target.value)} placeholder={folderBound && folderWritable ? "描述你要完成的任务…" : "请先绑定可写文件夹，再开始对话"} disabled={running || !selectedSession || !folderBound || !folderWritable} /><button disabled={running || !selectedSession || !folderBound || !folderWritable}>{running ? "处理中…" : "发送"}</button></form></section>
+    <section className="chat panel"><div className="chat-heading"><div><h2>对话</h2><p>{folderBound && folderWritable ? `当前会话工作区：${folderName || "已绑定"}` : folderBound ? "请重新选择可写文件夹，代码才能同步回本地。" : "每次对话前，请先绑定当前项目对应的文件夹。"}</p></div><button type="button" className={`run-status ${statusView.kind}`} aria-live="polite" onClick={() => void cancelRun()} disabled={!running || !activeRunId} title={running ? "点击取消当前任务" : undefined}><span className="run-status-icon" aria-hidden="true" />{statusView.label}</button></div><div className="timeline">{chatMessages.length === 0 && <p className="empty">选择项目和会话后，开始向 Agent 提问。</p>}{chatMessages.map(message => <article className={`chat-message ${message.role} ${message.status ?? ""}`} key={message.id}><div className="message-head"><span className="role-label">{message.role === "user" ? "你" : message.role === "assistant" ? "Huai-Coder" : "系统"}</span>{message.role === "assistant" && message.content && <button className="copy-button" onClick={() => copyMessage(message.content)}>复制</button>}</div><ActivityList activities={message.activities} />{message.content ? <div className="message-content"><Markdown value={message.content} /></div> : message.status === "running" && <div className="typing"><i /><i /><i />正在思考…</div>}{message.status === "failed" && <div className="message-error">本次运行未完成，可以继续发送指令。</div>}</article>)}</div><form onSubmit={submit}><input value={prompt} onChange={event => setPrompt(event.target.value)} placeholder={folderBound && folderWritable ? "描述你要完成的任务…" : "请先绑定可写文件夹，再开始对话"} disabled={running || !selectedSession || !folderBound || !folderWritable} /><button disabled={running || !selectedSession || !folderBound || !folderWritable}>{running ? "处理中…" : "发送"}</button></form></section>
     {approval && <div className="approval-modal"><div className="approval-card"><h2>需要审批：{approval.tool}</h2><p>风险等级：{approval.risk_level ?? "未标注"}</p><p>{approval.content}</p><pre>{approval.arguments}</pre><p>目标：{approval.target_path || "当前项目工作区"}</p>{approvalError && <p className="approval-error">{approvalError}</p>}<div className="action-row"><button onClick={() => decideApproval("approve")} disabled={approvalBusy}>{approvalBusy ? "处理中…" : "批准"}</button><button onClick={() => decideApproval("reject")} disabled={approvalBusy}>拒绝</button><button onClick={() => decideApproval("cancel")} disabled={approvalBusy}>取消</button></div></div></div>}
+    <MemoryOverviewPanel overview={memoryOverview} audits={memoryAudits} selectedAuditMemoryId={selectedAuditMemoryId} onAudit={id => void loadMemoryAudit(id)} onEdit={memory => void editMemory(memory)} onDelete={id => void removeMemory(id)} />
+    <McpDock servers={mcpServers} busy={mcpBusy} error={mcpError} expandedServer={expandedMcpServer} toolCache={mcpToolCache} onRefresh={() => void refreshMcpServers()} onConnect={id => void connectMcpServer(id)} onDisconnect={id => void disconnectMcpServer(id)} onReconnect={id => void reconnectMcpServer(id)} onToggleTools={id => void toggleMcpTools(id)} />
+    <SubAgentDock catalog={subagentCatalog} />
   </main>;
 }
 
