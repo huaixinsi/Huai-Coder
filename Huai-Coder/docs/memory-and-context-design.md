@@ -451,6 +451,10 @@ class PreparedContext(TypedDict):
 GET /api/projects/{project_id}/memories
 ```
 
+会话级、项目级和用户级长期记忆分别通过作用域过滤返回：当前会话使用
+`GET /api/sessions/{session_id}/memories/overview`，当前项目使用项目记忆接口，用户级全局记忆使用
+`scope_type=user`。会话概览接口同时返回三层记忆，便于前端按“当前会话 / 当前项目 / 用户记忆”展示。
+
 支持参数：
 
 ```text
@@ -470,6 +474,8 @@ POST /api/memories
 
 用户手动创建的记忆必须标记来源为 `manual`，并默认使用较高置信度。
 
+请求体中的 `scope_type` 支持 `session`、`project`、`user`。`user` 作用域使用固定全局范围标识，不能借助项目或会话参数越权读取其他用户数据；当前部署的单用户模式使用全局 scope id `0`。
+
 ### 11.3 修改记忆
 
 ```http
@@ -485,6 +491,15 @@ DELETE /api/memories/{memory_id}
 ```
 
 默认采用逻辑删除，审计记录保留；管理员或数据清理任务可执行物理清理。
+
+审计接口：
+
+```http
+GET /api/memories/{memory_id}/audit
+GET /api/projects/{project_id}/memories/audit?include_session=true
+```
+
+审计记录保存创建、更新、删除等动作，以及更新/删除前后的内容、原因、来源 Run 和时间。
 
 ### 11.5 会话摘要
 
@@ -523,7 +538,7 @@ MEMORY_DEFAULT_IMPORTANCE=5
 MEMORY_RETENTION_DAYS=90
 CONTEXT_COMPACTION_ENABLED=true
 CONTEXT_MAX_TOKENS=32768
-CONTEXT_COMPACTION_THRESHOLD=0.8
+CONTEXT_COMPACTION_THRESHOLD=0.75
 CONTEXT_RECENT_TURNS=8
 EMBEDDING_BASE_URL=
 EMBEDDING_API_KEY=

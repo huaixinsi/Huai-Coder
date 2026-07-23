@@ -230,11 +230,39 @@ class LocalRunner:
     ) -> dict[str, Any]:
         started = time.monotonic()
         process: subprocess.Popen[str] | None = None
+        effective_command = command
+        process_command: str | list[str] = effective_command
+        use_shell = True
+        if os.name == "nt":
+            # cmd.exe does not treat single quotes as argument delimiters. The
+            # common `python -c '...'` form can therefore silently run the
+            # Windows launcher without executing the snippet. Resolve the
+            # interpreter explicitly while preserving project venv support.
+            python_executable = Path(sys.executable).resolve()
+            if prefix:
+                candidate = self.workspace / prefix[0] / "python.exe"
+                if candidate.exists():
+                    python_executable = candidate.resolve()
+            effective_command = re.sub(
+                r"^python(?:3(?:\.\d+)?)?(?=\s|$)",
+                lambda _match: f'"{python_executable}"',
+                command,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            inline = re.match(r"^python(?:3(?:\.\d+)?)?\s+-c\s+'(?P<code>.*)'\s*$", command, re.IGNORECASE | re.DOTALL)
+            if inline:
+                # Avoid cmd.exe's incompatible single-quote parsing for the
+                # common Python inline-script form.
+                process_command = [str(python_executable), "-c", inline.group("code")]
+                use_shell = False
+            else:
+                process_command = effective_command
         try:
             process = subprocess.Popen(
-                command,
+                process_command,
                 cwd=self.workspace,
-                shell=True,
+                shell=use_shell,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,

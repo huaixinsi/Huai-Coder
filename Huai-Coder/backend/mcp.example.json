@@ -1,0 +1,72 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": "npx.cmd",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--user-data-dir=C:\\Users\\27982\\.huai-coder\\browser-profile"
+      ],
+      "scope": "user",
+      "connectTimeoutMs": 30000,
+      "callTimeoutMs": 120000,
+      "allowedTools": [
+        "browser_navigate",
+        "browser_tabs",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_wait_for"
+      ],
+      "approval": {
+        "browser_click": "auto",
+        "browser_type": "auto",
+        "browser_wait_for": "auto"
+      }
+    },
+    "github": {
+      "enabled": false,
+      "transport": "streamable_http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      },
+      "scope": "user",
+      "allowedTools": [
+        "get_me",
+        "search_repositories",
+        "get_file_contents",
+        "list_issues",
+        "issue_read",
+        "create_pull_request"
+      ],
+      "approval": {
+        "create_pull_request": "confirm",
+        "issue_write": "confirm"
+      }
+    },
+    "playwright-host": {
+      "enabled": false,
+      "transport": "sse",
+      "url": "http://host.docker.internal:8931/sse",
+      "scope": "user",
+      "connectTimeoutMs": 30000,
+      "callTimeoutMs": 120000,
+      "allowedTools": [
+        "browser_navigate",
+        "browser_tabs",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_wait_for"
+      ],
+      "approval": {
+        "browser_click": "auto",
+        "browser_type": "auto",
+        "browser_wait_for": "auto"
+      }
+    }
+  }
+}

@@ -28,7 +28,8 @@ async def execute_tool(name: str, arguments: dict[str, str], workspace: Path = W
                 return "Tool error: content is required"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            return f"Wrote {path.relative_to(workspace)} ({len(content)} bytes)"
+            relative = str(path.relative_to(workspace)).replace("\\", "/")
+            return f"Wrote {relative} ({len(content)} bytes)"
         if name == "grep_code":
             query = arguments.get("query", "")
             if not query:

@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     react_max_turns: int = 128
     client_tool_timeout_seconds: int = 300
     tool_approval_enabled: bool = False
+    mcp_enabled: bool = True
+    mcp_config_path: str = ""
+    mcp_config_write_enabled: bool = False
+    mcp_approval_enabled: bool = True
+    mcp_tool_timeout_seconds: int = 120
+    subagent_max_parallel: int = 4
+    subagent_max_per_run: int = 4
+    subagent_queue_timeout_seconds: float = 5.0
     context_recent_turns: int = 8
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     @property

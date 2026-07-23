@@ -13,6 +13,7 @@ from .registry import get_tool, TOOLS
 from .llm import ParsedToolCall, complete_with_tools
 from .agents.registry import list_subagents
 from .context import estimate_messages
+from .mcp import McpToolDescriptor, get_mcp_manager
 
 SENSITIVE_REQUEST_MARKERS = (
     ".env",
@@ -283,7 +284,10 @@ def _workspace_context(root: Path) -> str:
 
 
 def _build_system_prompt(
-    context: str, tool_approval_enabled: bool = True, local_workspace: bool = False
+    context: str,
+    tool_approval_enabled: bool = True,
+    local_workspace: bool = False,
+    mcp_tools: list[McpToolDescriptor] | None = None,
 ) -> str:
     """Build the main agent system prompt with tool descriptions and sub-agent list."""
     agents_desc = json.dumps(list_subagents(), ensure_ascii=False, indent=2)
@@ -297,6 +301,25 @@ def _build_system_prompt(
         if local_workspace
         else "Tools operate in the selected project workspace."
     )
+    mcp_note = "(没有已连接的 MCP 工具)"
+    if mcp_tools:
+        mcp_note = "\n".join(
+            f"- {tool.model_name}: {tool.description or tool.original_name}"
+            for tool in mcp_tools[:80]
+        )
+    browser_tools = [
+        tool.original_name
+        for tool in (mcp_tools or [])
+        if tool.original_name.startswith("browser_")
+    ]
+    browser_note = (
+        "Browser MCP is connected. For requests to open a page, search, click, type, or wait, "
+        f"you MUST use the listed browser MCP tools ({', '.join(browser_tools)}). "
+        "Do not claim that you cannot operate a browser or Windows desktop when these tools are available."
+        if browser_tools
+        else "Browser MCP is not connected in this run. Do not claim the project can never operate a browser; "
+        "tell the user that no browser_* MCP tool is currently connected and that a Playwright MCP Server must be configured and connected."
+    )
     return (
         "You are a coding assistant working inside a project workspace. "
         "You have tools to inspect and modify the project. Use them when needed.\n\n"
@@ -307,6 +330,10 @@ def _build_system_prompt(
         "- write_file(path, content): Create or overwrite source code and other workspace files\n"
         "- execute_command(command): Run a shell command\n"
         "- task(agent_name, task): Delegate to a sub-agent\n\n"
+        "## MCP Tools\n"
+        f"{mcp_note}\n\n"
+        "## Browser Automation\n"
+        f"{browser_note}\n\n"
         "## Sub-Agents\n"
         f"{agents_desc}\n\n"
         "## Rules\n"
@@ -322,7 +349,7 @@ def _build_system_prompt(
     )
 
 
-def _build_tool_schemas() -> list[dict]:
+def _build_tool_schemas(mcp_tools: list[McpToolDescriptor] | None = None) -> list[dict]:
     """OpenAI-compatible tool schemas for all main agent tools."""
     schemas = []
     PARAMS = {
@@ -401,6 +428,7 @@ def _build_tool_schemas() -> list[dict]:
                 "parameters": PARAMS.get(name, {"type": "object", "properties": {}}),
             },
         })
+    schemas.extend(tool.model_schema() for tool in mcp_tools or [])
     return schemas
 
 
@@ -412,6 +440,7 @@ class AgentState(TypedDict):
     events: list["AgentEvent"]
     local_workspace: bool
     run_id: int | None
+    cancel_event: asyncio.Event | None
 
 
 @dataclass
@@ -476,6 +505,7 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
     settings = get_settings()
     local_workspace = bool(state.get("local_workspace", False))
     run_id = state.get("run_id")
+    cancel_event = state.get("cancel_event")
     yield AgentEvent("run.started")
 
     if settings.tool_approval_enabled and any(
@@ -488,10 +518,39 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
 
     guard = PathGuard(Path(workspace))
     context = _workspace_context(Path(workspace))
+    mcp_manager = get_mcp_manager() if getattr(settings, "mcp_enabled", True) else None
+    mcp_tools: list[McpToolDescriptor] = []
+    if mcp_manager is not None:
+        for server in mcp_manager.server_statuses():
+            if server.get("enabled") and server.get("status") not in {"ready", "disabled"}:
+                yield AgentEvent("mcp.server.starting", server.get("id", ""))
+        try:
+            mcp_tools = await mcp_manager.list_tools()
+            for server in mcp_manager.server_statuses():
+                if server.get("status") == "failed":
+                    yield AgentEvent(
+                        "mcp.server.failed",
+                        json.dumps(
+                            {"server": server.get("id"), "error": server.get("error")},
+                            ensure_ascii=False,
+                        ),
+                    )
+                elif server.get("status") == "ready":
+                    yield AgentEvent("mcp.server.ready", server.get("id", ""))
+                    server_tools = [tool for tool in mcp_tools if tool.server_id == server.get("id")]
+                    yield AgentEvent(
+                        "mcp.tools.discovered",
+                        json.dumps(
+                            {"server": server.get("id"), "count": len(server_tools)},
+                            ensure_ascii=False,
+                        ),
+                    )
+        except Exception as error:
+            yield AgentEvent("mcp.registry.failed", str(error))
     system_prompt = _build_system_prompt(
-        context, settings.tool_approval_enabled, local_workspace
+        context, settings.tool_approval_enabled, local_workspace, mcp_tools
     )
-    tool_schemas = _build_tool_schemas()
+    tool_schemas = _build_tool_schemas(mcp_tools)
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": agent_prompt},
@@ -499,6 +558,9 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
     repeat_records: dict[str, _RepeatRecord] = {}
 
     for turn_no in range(1, getattr(settings, "react_max_turns", 128) + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            yield AgentEvent("run.cancelled", "任务已取消")
+            return
         messages, compacted = _bound_react_messages(
             messages,
             settings.context_max_tokens,
@@ -514,6 +576,9 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
             response = await complete_with_tools(messages, tool_schemas, timeout=120)
         except Exception as error:
             yield AgentEvent("run.failed", str(error))
+            return
+        if cancel_event is not None and cancel_event.is_set():
+            yield AgentEvent("run.cancelled", "任务已取消")
             return
 
         calls = response.tool_calls or ([response.tool_call] if response.tool_call else [])
@@ -538,22 +603,32 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
         blocked_call_ids: set[str] = set()
 
         for call in calls:
+            if cancel_event is not None and cancel_event.is_set():
+                yield AgentEvent("run.cancelled", "任务已取消")
+                return
             yield AgentEvent(
                 "tool.started",
                 json.dumps({"arguments": call.arguments}, ensure_ascii=False),
                 call.name,
             )
+            tool_spec = None
+            mcp_spec = mcp_manager.find_tool(call.name) if mcp_manager is not None else None
             try:
-                tool_spec = get_tool(call.name, caller="main")
+                if mcp_spec is None:
+                    tool_spec = get_tool(call.name, caller="main")
             except Exception as error:
                 tool_results.append((call, f"Error: {error}", False))
+                continue
+            if tool_spec is None and mcp_spec is None:
+                tool_results.append((call, f"Error: Unknown MCP tool: {call.name}", False))
                 continue
 
             signature = _call_signature(call.name, call.arguments)
             record = repeat_records.setdefault(signature, _RepeatRecord())
+            repeat_policy = tool_spec.repeat_policy if tool_spec is not None else mcp_spec.repeat_policy
             repeat_action = (
                 "execute"
-                if tool_spec.repeat_policy == "polling"
+                if repeat_policy == "polling"
                 else _repeat_action(record, signature)
             )
             if repeat_action != "execute":
@@ -575,18 +650,33 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
                 tool_results.append((call, f"Invalid tool arguments: {call.argument_error}", False))
                 continue
 
-            if (
-                settings.tool_approval_enabled
-                and not local_workspace
-                and tool_spec.risk.requires_approval
-            ):
+            requires_approval = (
+                tool_spec.risk.requires_approval
+                if tool_spec is not None
+                else mcp_spec.requires_approval
+            )
+            approval_enabled = (
+                settings.tool_approval_enabled and not local_workspace
+                if tool_spec is not None
+                else getattr(settings, "mcp_approval_enabled", True)
+            )
+            risk_reason = (
+                tool_spec.risk.reason
+                if tool_spec is not None
+                else mcp_spec.risk_reason
+            )
+            if approval_enabled and requires_approval:
+                if mcp_spec is not None:
+                    yield AgentEvent("mcp.tool.waiting_approval", risk_reason, call.name)
                 yield AgentEvent(
                     "approval.required",
                     json.dumps(
                         {
                             "tool": call.name,
                             "arguments": call.arguments,
-                            "reason": tool_spec.risk.reason,
+                            "reason": risk_reason,
+                            "server": mcp_spec.server_id if mcp_spec is not None else None,
+                            "risk_level": mcp_spec.risk_level if mcp_spec is not None else tool_spec.risk.level,
                         },
                         ensure_ascii=False,
                     ),
@@ -594,6 +684,28 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
                 )
                 yield AgentEvent("run.waiting", "等待工具审批")
                 return
+
+            if mcp_spec is not None:
+                yield AgentEvent(
+                    "mcp.tool.started",
+                    json.dumps(
+                        {"server": mcp_spec.server_id, "tool": mcp_spec.original_name},
+                        ensure_ascii=False,
+                    ),
+                    call.name,
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    yield AgentEvent("mcp.session.closed", mcp_spec.server_id, call.name)
+                    yield AgentEvent("run.cancelled", "任务已取消")
+                    return
+                result = await mcp_manager.call_tool(call.name, call.arguments)
+                tool_results.append((call, result.bounded_text(), result.ok))
+                yield AgentEvent(
+                    "mcp.tool.completed" if result.ok else "mcp.tool.failed",
+                    result.bounded_text(),
+                    call.name,
+                )
+                continue
 
             if local_workspace and call.name in CLIENT_TOOL_NAMES:
                 invocation_id = f"client-{uuid4().hex}"
@@ -618,13 +730,37 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
 
             try:
                 handler = tool_spec.handler
+                subagent_name = (
+                    str(call.arguments.get("agent_name", ""))
+                    if call.name == "task"
+                    else ""
+                )
+                if call.name == "task":
+                    yield AgentEvent(
+                        "agent.started",
+                        json.dumps(
+                            {
+                                "agent_name": subagent_name,
+                                "task": call.arguments.get("task", ""),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        call.name,
+                    )
+                handler_arguments = dict(call.arguments)
+                if call.name == "task":
+                    handler_arguments["run_id"] = run_id
                 if asyncio.iscoroutinefunction(handler):
-                    result = await handler(guard=guard, **call.arguments)
+                    result = await handler(guard=guard, **handler_arguments)
                 else:
-                    result = handler(guard=guard, **call.arguments)
+                    result = handler(guard=guard, **handler_arguments)
                 tool_results.append((call, str(result)[:12000], True))
+                if call.name == "task":
+                    yield AgentEvent("agent.finished", str(result)[:12000], subagent_name)
             except Exception as error:
                 tool_results.append((call, f"Error: {error}", False))
+                if call.name == "task":
+                    yield AgentEvent("agent.failed", str(error), subagent_name)
 
         if client_requests:
             client_futures = {
@@ -695,7 +831,22 @@ async def _run_react_stream(state: AgentState) -> AsyncIterator[AgentEvent]:
                         call.name,
                     )
             except Exception:
-                pass
+                mcp_spec = mcp_manager.find_tool(call.name) if mcp_manager is not None else None
+                if mcp_spec is not None:
+                    record = repeat_records[_call_signature(call.name, call.arguments)]
+                    stale = _record_tool_result(
+                        record,
+                        _call_signature(call.name, call.arguments),
+                        result,
+                        None,
+                        mcp_spec.repeat_policy,
+                    )
+                    if stale and record.stale_streak == 3:
+                        yield AgentEvent(
+                            "tool.repeat_warning",
+                            "DUPLICATE_CALL_REPLAN: repeated MCP call made no observable progress; choose a different action.",
+                            call.name,
+                        )
 
         if terminal_message:
             yield AgentEvent("message.delta", terminal_message)
@@ -932,6 +1083,7 @@ async def run_agent(
     context_text: str | None = None,
     local_workspace: bool = True,
     run_id: int | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> AsyncIterator[AgentEvent]:
     previous = "\n".join(
         f"{role}: {content}" for role, content in (history or [])[-20:]
@@ -949,6 +1101,7 @@ async def run_agent(
         "workspace": workspace,
         "local_workspace": local_workspace,
         "run_id": run_id,
+        "cancel_event": cancel_event,
     }
     async for event in _run_react_stream(state):
         yield event

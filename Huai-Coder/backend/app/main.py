@@ -9,12 +9,14 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 import json
 import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 from .agent import AgentEvent, resolve_client_tool_result, run_agent
 from .context import ContextManager
 from .memory import (
@@ -23,7 +25,7 @@ from .memory import (
     MemoryCandidate,
     MemoryService,
 )
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .database import Base, engine, get_db, SessionLocal
@@ -36,6 +38,7 @@ from .models import (
     Memory,
     MemoryAudit,
     ConversationSummary,
+    BrowserSessionRecord,
     Plan,
     Task,
     Project,
@@ -50,10 +53,13 @@ from .executor import (
 )
 from .llm import complete
 from .registry import get_tool
+from .agents.registry import list_subagents
 from .security import PathGuard
+from .mcp import get_mcp_manager
 
 settings = get_settings()
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "/workspace")).resolve()
+_RUN_CANCEL_EVENTS: dict[int, asyncio.Event] = {}
 
 
 @asynccontextmanager
@@ -92,6 +98,10 @@ async def lifespan(_: FastAPI):
             )
         )
     yield
+    try:
+        await get_mcp_manager().close_all()
+    except Exception:
+        pass
     await engine.dispose()
 
 
@@ -124,7 +134,7 @@ class MessageRequest(BaseModel):
 class MemoryCreateRequest(BaseModel):
     project_id: int
     session_id: int | None = None
-    scope_type: str = Field(default="project", pattern="^(project|session)$")
+    scope_type: str = Field(default="project", pattern="^(user|project|session)$")
     memory_type: str = Field(default="fact", pattern="^(fact|preference|decision|constraint|task|summary)$")
     content: str = Field(min_length=6, max_length=4000)
     importance: int = Field(default=5, ge=1, le=10)
@@ -139,6 +149,45 @@ class MemoryPatchRequest(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
     expires_at: datetime | None = None
     status: str | None = Field(default=None, pattern="^(active|deleted)$")
+
+
+class McpServerUpsertRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    config: dict = Field(default_factory=dict)
+
+
+class McpServerPatchRequest(BaseModel):
+    config: dict | None = None
+    enabled: bool | None = None
+
+
+class BrowserSessionRequest(BaseModel):
+    server_id: str = Field(default="playwright", min_length=1, max_length=64)
+    linked_session_id: int | None = None
+    run_id: int | None = None
+    persistent_profile: bool = False
+    current_url: str | None = Field(default=None, max_length=2000)
+
+
+def _safe_browser_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        host = parsed.hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))[:1000]
+    except ValueError:
+        return None
+
+
+def _require_mcp_config_write() -> None:
+    if not getattr(settings, "mcp_config_write_enabled", False):
+        raise HTTPException(403, "MCP 配置 API 默认只读，请设置 MCP_CONFIG_WRITE_ENABLED=true 后再修改配置")
 
 
 @app.get("/api/projects")
@@ -302,6 +351,19 @@ def _memory_payload(memory: Memory) -> dict:
     }
 
 
+def _memory_audit_payload(audit: MemoryAudit) -> dict:
+    return {
+        "id": audit.id,
+        "memory_id": audit.memory_id,
+        "action": audit.action,
+        "before_content": audit.before_content,
+        "after_content": audit.after_content,
+        "reason": audit.reason,
+        "source_run_id": audit.source_run_id,
+        "created_at": audit.created_at,
+    }
+
+
 async def _validate_memory_scope(
     project_id: int, session_id: int | None, scope_type: str, db: AsyncSession
 ) -> None:
@@ -393,7 +455,13 @@ async def create_memory(request: MemoryCreateRequest, db: AsyncSession = Depends
     service = MemoryService(settings)
     candidate = MemoryCandidate(
         scope_type=request.scope_type,
-        scope_id=request.session_id if request.scope_type == "session" else request.project_id,
+        scope_id=(
+            request.session_id
+            if request.scope_type == "session"
+            else GLOBAL_MEMORY_SCOPE_ID
+            if request.scope_type == "user"
+            else request.project_id
+        ),
         memory_type=request.memory_type,
         content=request.content,
         importance=request.importance,
@@ -414,6 +482,7 @@ async def update_memory(memory_id: int, request: MemoryPatchRequest, db: AsyncSe
     memory = await db.get(Memory, memory_id)
     if memory is None:
         raise HTTPException(404, "Memory not found")
+    before_content = memory.content
     if request.content is not None:
         from .memory import contains_sensitive, normalize_content
         if contains_sensitive(request.content):
@@ -430,7 +499,15 @@ async def update_memory(memory_id: int, request: MemoryPatchRequest, db: AsyncSe
         memory.expires_at = request.expires_at
     if request.status is not None:
         memory.status = request.status
-    db.add(MemoryAudit(memory_id=memory.id, action="update", after_content=memory.content, reason="manual update"))
+    db.add(
+        MemoryAudit(
+            memory_id=memory.id,
+            action="update",
+            before_content=before_content,
+            after_content=memory.content,
+            reason="manual update",
+        )
+    )
     await db.commit()
     await db.refresh(memory)
     return _memory_payload(memory)
@@ -443,6 +520,59 @@ async def delete_memory(memory_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "Memory not found")
     await MemoryService(settings).delete(db, memory)
     await db.commit()
+
+
+@app.get("/api/memories/{memory_id}/audit")
+async def list_memory_audit(memory_id: int, db: AsyncSession = Depends(get_db)):
+    if await db.get(Memory, memory_id) is None:
+        raise HTTPException(404, "Memory not found")
+    rows = list(
+        (
+            await db.scalars(
+                select(MemoryAudit)
+                .where(MemoryAudit.memory_id == memory_id)
+                .order_by(MemoryAudit.id.desc())
+            )
+        ).all()
+    )
+    return [_memory_audit_payload(row) for row in rows]
+
+
+@app.get("/api/projects/{project_id}/memories/audit")
+async def list_project_memory_audit(
+    project_id: int,
+    include_session: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    if await db.get(Project, project_id) is None:
+        raise HTTPException(404, "Project not found")
+    scope_filter = [
+        (Memory.scope_type == "project") & (Memory.scope_id == project_id)
+    ]
+    if include_session:
+        session_ids = list(
+            (
+                await db.scalars(
+                    select(Session.id).where(Session.project_id == project_id)
+                )
+            ).all()
+        )
+        if session_ids:
+            scope_filter.append(
+                (Memory.scope_type == "session")
+                & (Memory.scope_id.in_(session_ids))
+            )
+    memory_ids = select(Memory.id).where(or_(*scope_filter))
+    rows = list(
+        (
+            await db.scalars(
+                select(MemoryAudit)
+                .where(MemoryAudit.memory_id.in_(memory_ids))
+                .order_by(MemoryAudit.id.desc())
+            )
+        ).all()
+    )
+    return [_memory_audit_payload(row) for row in rows]
 
 
 @app.get("/api/sessions/{session_id}/summary")
@@ -488,6 +618,227 @@ async def health(db: AsyncSession = Depends(get_db)):
     return {"status": "ok"}
 
 
+@app.get("/api/subagents")
+async def subagent_catalog():
+    """Expose the SubAgent graph and immutable role/permission declarations."""
+    return {
+        "graph": {
+            "type": "langgraph.subgraph",
+            "root": "react",
+            "child": "subagent.react",
+            "edges": ["react -> subagent.react -> react"],
+        },
+        "agents": list_subagents(),
+    }
+
+
+@app.get("/api/mcp/servers")
+async def list_mcp_servers():
+    """Return configured MCP servers without returning environment secrets."""
+    return {"servers": get_mcp_manager().server_statuses()}
+
+
+@app.post("/api/mcp/servers", status_code=201)
+async def create_mcp_server(request: McpServerUpsertRequest):
+    _require_mcp_config_write()
+    try:
+        config = dict(request.config)
+        if not config and request.model_extra:
+            config = dict(request.model_extra)
+        return {"server": await get_mcp_manager().upsert_server(request.id, config)}
+    except Exception as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/api/mcp/servers/{server_id}")
+async def get_mcp_server(server_id: str):
+    try:
+        return {"server": next(item for item in get_mcp_manager().server_statuses() if item["id"] == server_id)}
+    except StopIteration as error:
+        raise HTTPException(404, "MCP server not found") from error
+
+
+@app.patch("/api/mcp/servers/{server_id}")
+async def patch_mcp_server(server_id: str, request: McpServerPatchRequest):
+    _require_mcp_config_write()
+    manager = get_mcp_manager()
+    try:
+        current = manager.server_config_mapping(server_id)
+        if request.config is not None:
+            current.update(request.config)
+        if request.enabled is not None:
+            current["enabled"] = request.enabled
+        return {"server": await manager.upsert_server(server_id, current)}
+    except Exception as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.delete("/api/mcp/servers/{server_id}", status_code=204)
+async def delete_mcp_server(server_id: str):
+    _require_mcp_config_write()
+    try:
+        await get_mcp_manager().remove_server(server_id)
+    except Exception as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.post("/api/mcp/servers/{server_id}/connect")
+async def connect_mcp_server(server_id: str):
+    try:
+        await get_mcp_manager().connect(server_id)
+        return {"server": next(item for item in get_mcp_manager().server_statuses() if item["id"] == server_id)}
+    except Exception as error:
+        raise HTTPException(502, str(error)) from error
+
+
+@app.post("/api/mcp/servers/{server_id}/disconnect")
+async def disconnect_mcp_server(server_id: str):
+    try:
+        return {"server": await get_mcp_manager().disconnect(server_id)}
+    except Exception as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.post("/api/mcp/servers/{server_id}/reconnect")
+async def reconnect_mcp_server(server_id: str):
+    try:
+        return {"server": await get_mcp_manager().reconnect(server_id)}
+    except Exception as error:
+        raise HTTPException(502, str(error)) from error
+
+
+@app.get("/api/mcp/servers/{server_id}/tools")
+async def list_server_mcp_tools(server_id: str):
+    try:
+        tools = await get_mcp_manager().list_server_tools(server_id)
+        return {
+            "server": server_id,
+            "status": get_mcp_manager().runtime_info(server_id).get("status"),
+            "tools": [tool.public_dict() for tool in tools],
+        }
+    except Exception as error:
+        raise HTTPException(502, str(error)) from error
+
+
+@app.post("/api/mcp/refresh")
+async def refresh_mcp_tools():
+    try:
+        manager = get_mcp_manager()
+        await manager.reload_config()
+        tools = await manager.list_tools()
+        return {
+            "servers": manager.server_statuses(),
+            "tools": [tool.public_dict() for tool in tools],
+        }
+    except Exception as error:
+        raise HTTPException(502, str(error)) from error
+
+
+@app.get("/api/mcp/tools")
+async def list_mcp_tools(scope: str | None = None, session_id: int | None = None):
+    try:
+        tools = await get_mcp_manager().list_tools()
+        # The first implementation keeps scope filtering conservative: user and
+        # project tools are both visible to a run, while unknown scopes return no
+        # tools rather than accidentally widening access.
+        if scope and scope not in {"user", "project", "session", "all"}:
+            return {"scope": scope, "session_id": session_id, "tools": []}
+        return {"scope": scope or "all", "session_id": session_id, "tools": [tool.public_dict() for tool in tools]}
+    except Exception as error:
+        raise HTTPException(502, str(error)) from error
+
+
+@app.get("/api/browser/sessions")
+async def list_browser_sessions(db: AsyncSession = Depends(get_db)):
+    return (await db.scalars(select(BrowserSessionRecord).order_by(BrowserSessionRecord.id.desc()))).all()
+
+
+@app.post("/api/browser/sessions", status_code=201)
+async def create_browser_session(request: BrowserSessionRequest, db: AsyncSession = Depends(get_db)):
+    if request.linked_session_id is not None and await db.get(Session, request.linked_session_id) is None:
+        raise HTTPException(404, "Linked chat session not found")
+    if request.run_id is not None and await db.get(AgentRun, request.run_id) is None:
+        raise HTTPException(404, "Run not found")
+    try:
+        await get_mcp_manager().connect(request.server_id)
+        runtime = get_mcp_manager().runtime_info(request.server_id)
+    except Exception as error:
+        raise HTTPException(502, str(error)) from error
+    record = BrowserSessionRecord(
+        session_key=f"browser-{uuid4().hex}",
+        server_id=request.server_id,
+        linked_session_id=request.linked_session_id,
+        run_id=request.run_id,
+        process_id=str(runtime.get("process_id")) if runtime.get("process_id") else None,
+        gateway_session_id=runtime.get("gateway_session_id"),
+        status="ready",
+        current_url=_safe_browser_url(request.current_url),
+        persistent_profile=request.persistent_profile,
+    )
+    db.add(record)
+    if request.run_id is not None:
+        db.add(AgentEventRecord(run_id=request.run_id, event_type="mcp.session.created", content=request.server_id))
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
+@app.get("/api/browser/sessions/{session_id}")
+async def get_browser_session(session_id: int, db: AsyncSession = Depends(get_db)):
+    record = await db.get(BrowserSessionRecord, session_id)
+    if record is None:
+        raise HTTPException(404, "Browser session not found")
+    return record
+
+
+async def _close_browser_session(record: BrowserSessionRecord, db: AsyncSession):
+    try:
+        await get_mcp_manager().disconnect(record.server_id)
+    except Exception:
+        # The child may already be gone; the durable record still needs a
+        # terminal state so the frontend does not remain in loading forever.
+        pass
+    record.status = "closed"
+    record.closed_at = datetime.now(timezone.utc)
+    record.last_heartbeat_at = datetime.now(timezone.utc)
+    if record.run_id is not None:
+        db.add(AgentEventRecord(run_id=record.run_id, event_type="mcp.session.closed", content=record.server_id))
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
+@app.post("/api/browser/sessions/{session_id}/stop")
+async def stop_browser_session(session_id: int, db: AsyncSession = Depends(get_db)):
+    record = await db.get(BrowserSessionRecord, session_id)
+    if record is None:
+        raise HTTPException(404, "Browser session not found")
+    return await _close_browser_session(record, db)
+
+
+@app.post("/api/browser/sessions/{session_id}/reset")
+async def reset_browser_session(session_id: int, db: AsyncSession = Depends(get_db)):
+    record = await db.get(BrowserSessionRecord, session_id)
+    if record is None:
+        raise HTTPException(404, "Browser session not found")
+    try:
+        await get_mcp_manager().reconnect(record.server_id)
+        runtime = get_mcp_manager().runtime_info(record.server_id)
+        record.status = "ready"
+        record.closed_at = None
+        record.process_id = str(runtime.get("process_id")) if runtime.get("process_id") else None
+        record.gateway_session_id = runtime.get("gateway_session_id")
+        record.last_heartbeat_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(record)
+        return record
+    except Exception as error:
+        record.status = "failed"
+        record.last_heartbeat_at = datetime.now(timezone.utc)
+        await db.commit()
+        raise HTTPException(502, str(error)) from error
+
+
 class RunRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=12000)
     project_id: int
@@ -527,6 +878,8 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(run)
     await db.refresh(user_message)
+    cancel_event = asyncio.Event()
+    _RUN_CANCEL_EVENTS[run.id] = cancel_event
 
     async def events():
         try:
@@ -564,6 +917,7 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                 context_text=prepared_context.render(),
                 local_workspace=request.local_workspace,
                 run_id=run.id,
+                cancel_event=cancel_event,
             ):
                 event_payload = {
                     "run_id": run.id,
@@ -584,8 +938,9 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                         risk_level = tool_spec.risk.level
                         risk_reason = details.get("reason") or tool_spec.risk.reason
                     except Exception:
-                        risk_level = details.get("risk_level") or "medium"
-                        risk_reason = details.get("reason") or "需要人工确认后才能继续执行"
+                        mcp_tool = get_mcp_manager().find_tool(tool_name)
+                        risk_level = details.get("risk_level") or (mcp_tool.risk_level if mcp_tool else "medium")
+                        risk_reason = details.get("reason") or (mcp_tool.risk_reason if mcp_tool else "需要人工确认后才能继续执行")
                     approval = Approval(
                         run_id=run.id,
                         session_id=session.id,
@@ -614,12 +969,14 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
                         tool=event.tool,
                     )
                 )
-                if event.type in {"run.finished", "run.failed", "run.limited"}:
+                if event.type in {"run.finished", "run.failed", "run.limited", "run.cancelled"}:
                     run.status = (
                         "completed"
                         if event.type == "run.finished"
                         else "limited"
                         if event.type == "run.limited"
+                        else "stopped"
+                        if event.type == "run.cancelled"
                         else "failed"
                     )
                 elif event.type == "run.waiting":
@@ -652,12 +1009,30 @@ async def create_run(request: RunRequest, db: AsyncSession = Depends(get_db)):
             db.add(failure)
             await db.commit()
             yield f"data: {json.dumps({'run_id': run.id, 'type': 'run.failed', 'content': 'Agent run failed'}, ensure_ascii=False)}\n\n"
+        finally:
+            _RUN_CANCEL_EVENTS.pop(run.id, None)
 
     return StreamingResponse(
         events(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/runs/{run_id}/cancel")
+async def cancel_run(run_id: int, db: AsyncSession = Depends(get_db)):
+    run = await db.get(AgentRun, run_id)
+    if run is None:
+        raise HTTPException(404, "Run not found")
+    if run.status in {"completed", "failed", "limited", "stopped"}:
+        return {"run_id": run.id, "status": run.status, "already_finished": True}
+    event = _RUN_CANCEL_EVENTS.get(run_id)
+    if event is not None:
+        event.set()
+    run.status = "stopped"
+    db.add(AgentEventRecord(run_id=run.id, event_type="run.cancelled", content="用户取消任务"))
+    await db.commit()
+    return {"run_id": run.id, "status": run.status, "cancelled": True}
 
 
 @app.get("/api/runs/{run_id}/events")
@@ -714,25 +1089,40 @@ async def get_approval(approval_id: int, db: AsyncSession = Depends(get_db)):
     return await _get_approval(approval_id, db)
 
 
+@app.get("/api/mcp/approvals/{approval_id}")
+async def get_mcp_approval(approval_id: int, db: AsyncSession = Depends(get_db)):
+    return await _get_approval(approval_id, db)
+
+
 async def _execute_approved_tool(approval: Approval, db: AsyncSession) -> str:
     session = await db.get(Session, approval.session_id)
     if session is None:
         return "执行失败：关联会话不存在。"
+    mcp_event_type: str | None = None
     try:
-        tool_spec = get_tool(approval.tool_name)
         arguments = json.loads(approval.arguments or "{}")
         if not isinstance(arguments, dict):
             raise ValueError("审批参数必须是 JSON 对象")
-        workspace = (WORKSPACE_ROOT / "projects" / str(session.project_id)).resolve()
-        workspace.mkdir(parents=True, exist_ok=True)
-        result = tool_spec.handler(guard=PathGuard(workspace), **arguments)
-        if asyncio.iscoroutine(result):
-            result = await result
-        output = str(result)[:12000]
+        if approval.tool_name.startswith("mcp__"):
+            result = await get_mcp_manager().call_tool(approval.tool_name, arguments)
+            output = result.bounded_text()
+            if not result.ok:
+                raise RuntimeError(output)
+            mcp_event_type = "mcp.tool.completed"
+        else:
+            tool_spec = get_tool(approval.tool_name)
+            workspace = (WORKSPACE_ROOT / "projects" / str(session.project_id)).resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            result = tool_spec.handler(guard=PathGuard(workspace), **arguments)
+            if asyncio.iscoroutine(result):
+                result = await result
+            output = str(result)[:12000]
         event_type = "tool.finished"
     except Exception as error:
         output = f"审批后执行失败：{error}"
         event_type = "tool.failed"
+        if approval.tool_name.startswith("mcp__"):
+            mcp_event_type = "mcp.tool.failed"
 
     db.add(
         AgentEventRecord(
@@ -742,6 +1132,15 @@ async def _execute_approved_tool(approval: Approval, db: AsyncSession) -> str:
             tool=approval.tool_name,
         )
     )
+    if mcp_event_type:
+        db.add(
+            AgentEventRecord(
+                run_id=approval.run_id,
+                event_type=mcp_event_type,
+                content=output,
+                tool=approval.tool_name,
+            )
+        )
     db.add(
         AuditLog(
             project_id=session.project_id,
@@ -802,6 +1201,7 @@ async def _continue_after_approval(
     workspace = str((WORKSPACE_ROOT / "projects" / str(session.project_id)).resolve())
     continuation_events: list[dict] = []
     waiting_for_approval = False
+    cancel_event = _RUN_CANCEL_EVENTS.setdefault(run.id, asyncio.Event())
 
     try:
         async for event in run_agent(
@@ -812,6 +1212,7 @@ async def _continue_after_approval(
             context_text=prepared_context.render(),
             local_workspace=True,
             run_id=run.id,
+            cancel_event=cancel_event,
         ):
             event_payload = {
                 "run_id": run.id,
@@ -832,8 +1233,9 @@ async def _continue_after_approval(
                     risk_level = tool_spec.risk.level
                     risk_reason = details.get("reason") or tool_spec.risk.reason
                 except Exception:
-                    risk_level = details.get("risk_level") or "medium"
-                    risk_reason = details.get("reason") or "需要人工确认后才能继续执行"
+                    mcp_tool = get_mcp_manager().find_tool(tool_name)
+                    risk_level = details.get("risk_level") or (mcp_tool.risk_level if mcp_tool else "medium")
+                    risk_reason = details.get("reason") or (mcp_tool.risk_reason if mcp_tool else "需要人工确认后才能继续执行")
                 next_approval = Approval(
                     run_id=run.id,
                     session_id=session.id,
@@ -890,6 +1292,8 @@ async def _continue_after_approval(
         continuation_events.append(
             {"run_id": run.id, "type": "run.failed", "content": str(error)}
         )
+    finally:
+        _RUN_CANCEL_EVENTS.pop(run.id, None)
 
     if run.status == "completed":
         await MemoryService(settings).extract_and_persist(
@@ -940,8 +1344,20 @@ async def resolve_approval(
     approval.status = status
     approval.resolution_reason = reason
     approval.resolved_at = datetime.now(timezone.utc)
+    if approval.tool_name.startswith("mcp__"):
+        db.add(
+            AgentEventRecord(
+                run_id=approval.run_id,
+                event_type="mcp.tool.approved" if status == "APPROVED" else "mcp.tool.rejected",
+                content=reason or "",
+                tool=approval.tool_name,
+            )
+        )
     if status != "APPROVED":
         session = await db.get(Session, approval.session_id)
+        run = await db.get(AgentRun, approval.run_id)
+        if run is not None:
+            run.status = "stopped"
         if session is not None:
             decision_label = "拒绝" if status == "REJECTED" else "取消"
             db.add(
@@ -974,8 +1390,22 @@ async def approve_approval(
     return await resolve_approval(approval_id, "APPROVED", decision.reason, db)
 
 
+@app.post("/api/mcp/approvals/{approval_id}/approve")
+async def approve_mcp_approval(
+    approval_id: int, decision: ApprovalDecision, db: AsyncSession = Depends(get_db)
+):
+    return await resolve_approval(approval_id, "APPROVED", decision.reason, db)
+
+
 @app.post("/api/approvals/{approval_id}/reject")
 async def reject_approval(
+    approval_id: int, decision: ApprovalDecision, db: AsyncSession = Depends(get_db)
+):
+    return await resolve_approval(approval_id, "REJECTED", decision.reason, db)
+
+
+@app.post("/api/mcp/approvals/{approval_id}/reject")
+async def reject_mcp_approval(
     approval_id: int, decision: ApprovalDecision, db: AsyncSession = Depends(get_db)
 ):
     return await resolve_approval(approval_id, "REJECTED", decision.reason, db)
